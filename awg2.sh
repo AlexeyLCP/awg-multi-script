@@ -3005,6 +3005,7 @@ _warp_install_wgcf() {
 
   info "Устанавливаем wgcf..."
 
+  # ───── архитектура ─────
   local arch
   case "$(uname -m)" in
     x86_64)  arch="amd64" ;;
@@ -3013,7 +3014,7 @@ _warp_install_wgcf() {
     *) err "Неподдерживаемая архитектура: $(uname -m)"; return 1 ;;
   esac
 
-  # Получаем последнюю версию
+  # ───── версия ─────
   local latest_tag=""
   info "Узнаём последнюю версию wgcf..."
   latest_tag=$(curl -4 -fsSL --connect-timeout 8 --max-time 15 \
@@ -3022,122 +3023,79 @@ _warp_install_wgcf() {
 
   local versions=()
   [[ -n "$latest_tag" ]] && versions+=("${latest_tag#v}")
-  versions+=("2.2.30" "2.2.29" "2.2.28" "2.2.27" "2.2.26")
+  versions+=("2.2.30" "2.2.29" "2.2.28")
 
-  # Зеркала
+  # ───── зеркала ─────
   local mirrors=(
     ""
-    "https://ghfast.top/"
-    "https://gh-proxy.com/"
     "https://ghproxy.net/"
-    "https://mirror.ghproxy.com/"
-    "https://github.moeyy.xyz/"
-    "https://cors.isomorphic-git.org/"
   )
 
-# ───── fastest mirror ─────
-info "Выбор самого быстрого зеркала..."
-
-declare -A mirror_speed
-local best_mirrors=()
-
-  for mp in "${mirrors[@]}"; do
-  local key="${mp:-direct}"
-
-  # ТЕСТИРУЕМ РЕАЛЬНЫЙ ФАЙЛ (ключевой момент!)
-  local test_url="${mp}https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${arch}"
-
-  local t
-  t=$(curl -4 -o /dev/null -s --fail \
-      --connect-timeout 5 \
-      --max-time 8 \
-      --range 0-100 \
-      -w "%{time_total}" \
-      "$test_url" 2>/dev/null)
-
-  # фильтр мусора
-  if [[ -z "$t" || "$t" == "0.000" || "$t" == "0.001" ]]; then
-    t=999
+  # ───── установка rclone (БЕЗ apt) ─────
+  if ! command -v rclone &>/dev/null; then
+    info "Устанавливаем rclone (быстро)..."
+    if timeout 60s bash -c 'curl -fsSL https://rclone.org/install.sh | bash' >/dev/null 2>&1; then
+      ok "rclone установлен"
+    else
+      warn "Не удалось установить rclone — fallback будет ограничен"
+    fi
   fi
 
-  mirror_speed["$key"]=$t
-  info "  ${key} → ${t}s"
-  done
-
- best_mirrors=($(for k in "${!mirror_speed[@]}"; do
-  echo "${mirror_speed[$k]}|$k"
- done | sort -n | cut -d'|' -f2))
-
- info "Порядок зеркал:"
- for m in "${best_mirrors[@]}"; do
-  info "  → ${m}"
-  done
-
-  # ───── загрузка ─────
+  # ───── загрузка wgcf ─────
   local downloaded=0
 
   for ver in "${versions[@]}"; do
     info "Пробуем версию v${ver}..."
 
-    for mp in "${best_mirrors[@]}"; do
+    for mp in "${mirrors[@]}"; do
       local real_mp="$mp"
-      [[ "$real_mp" == "direct" ]] && real_mp=""
+      local label="${real_mp:-direct}"
 
       local url="${real_mp}https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
+      info "  → источник: ${label}"
 
-      if [[ -z "$real_mp" ]]; then
-        info "  curl ${url:0:80}..."
-      else
-        info "  via ${real_mp:0:40}..."
+      local ok_dl=0
+
+      # 1. CURL (быстро в ЕС)
+      info "    → curl..."
+      if timeout 20s curl -4 -L --fail --silent \
+        --connect-timeout 5 \
+        --max-time 20 \
+        --retry 1 \
+        "$url" -o /tmp/wgcf_dl 2>/dev/null; then
+        ok_dl=1
       fi
 
-      local curl_err
-      curl_err=$(timeout 25s curl -4 -L --fail --silent --show-error \
-        --connect-timeout 8 \
-        --max-time 20 \
-        --retry 2 --retry-delay 2 \
-        --speed-time 10 --speed-limit 1024 \
-        "$url" -o /tmp/wgcf_dl 2>&1)
-
-      local curl_rc=$?
-
-      # fallback wget
-      if [[ $curl_rc -ne 0 ]]; then
-        warn "  curl не сработал → wget"
-        if timeout 25s wget -4 --tries=2 --timeout=10 \
+      # 2. WGET
+      if [[ $ok_dl -eq 0 ]]; then
+        warn "    curl → wget"
+        if timeout 20s wget -4 --tries=1 --timeout=10 \
           "$url" -O /tmp/wgcf_dl 2>/dev/null; then
-          curl_rc=0
+          ok_dl=1
         fi
       fi
 
-      if [[ $curl_rc -eq 0 ]]; then
+      # 3. RCLONE (надёжно при блоках)
+      if [[ $ok_dl -eq 0 ]] && command -v rclone &>/dev/null; then
+        warn "    wget → rclone (прогресс ниже)"
+        if timeout 120s rclone copyurl "$url" /tmp/wgcf_dl -P; then
+          ok_dl=1
+        fi
+      fi
+
+      # ───── проверка ─────
+      if [[ $ok_dl -eq 1 ]]; then
         local sz
         sz=$(wc -c < /tmp/wgcf_dl 2>/dev/null || echo 0)
 
         if [[ $sz -lt 1000000 ]]; then
-          warn "  маленький файл ($sz)"
+          warn "    файл слишком маленький ($sz)"
           rm -f /tmp/wgcf_dl
           continue
         fi
 
-        local ftype
-        ftype=$(file -b /tmp/wgcf_dl 2>/dev/null || echo "")
-
-        if [[ ! "$ftype" =~ ELF ]]; then
-          warn "  не бинарник: ${ftype:0:60}"
-          rm -f /tmp/wgcf_dl
-          continue
-        fi
-
-        local expected_arch=""
-        case "$arch" in
-          amd64) expected_arch="x86-64" ;;
-          arm64) expected_arch="aarch64" ;;
-          armv7) expected_arch="ARM" ;;
-        esac
-
-        if [[ -n "$expected_arch" ]] && [[ ! "$ftype" =~ $expected_arch ]]; then
-          warn "  неверная архитектура"
+        if ! file /tmp/wgcf_dl | grep -q ELF; then
+          warn "    не ELF бинарник"
           rm -f /tmp/wgcf_dl
           continue
         fi
@@ -3145,32 +3103,32 @@ local best_mirrors=()
         mv -f /tmp/wgcf_dl /usr/local/bin/wgcf
         chmod +x /usr/local/bin/wgcf
 
-        if /usr/local/bin/wgcf --help &>/dev/null; then
+        if wgcf --help &>/dev/null; then
           ok "wgcf установлен (v${ver})"
           downloaded=1
           break
         else
-          warn "  бинарь не запускается"
+          warn "    бинарь не запускается"
           rm -f /usr/local/bin/wgcf
         fi
-      else
-        warn "  curl rc=$curl_rc"
-        rm -f /tmp/wgcf_dl 2>/dev/null
       fi
+
+      rm -f /tmp/wgcf_dl 2>/dev/null
     done
 
     [[ $downloaded -eq 1 ]] && break
   done
 
   if [[ $downloaded -eq 0 ]]; then
-    err "Не удалось скачать wgcf"
+    err "Не удалось скачать wgcf (сеть/блокировка CDN)"
     return 1
   fi
 
-  # WireGuard
+  # ───── wireguard ─────
   if ! command -v wg-quick &>/dev/null; then
     info "Устанавливаем wireguard-tools..."
-    apt-get install -y -q wireguard-tools 2>/dev/null || warn "wireguard-tools не установился"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y wireguard-tools >/dev/null 2>&1
   fi
 
   return 0
