@@ -156,10 +156,9 @@ d) Удалить Warp полностью
 
 ```bash
 # Скачать установщик из того же репо
-sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/tg-bot.sh -o /tmp/tg-bot.sh
-
+sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh
 # Запустить
-sudo bash /tmp/tg-bot.sh
+sudo bash /tmp/awg-bot-install.sh
 ```
 
 В процессе установщик спросит:
