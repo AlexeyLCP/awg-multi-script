@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.7.4"
+VERSION="v6.7.7"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -73,6 +73,22 @@ WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_TIMER="/etc/systemd/system/awg-warp-healthcheck.timer"
 WARP_HEALTH_SERVICE="/etc/systemd/system/awg-warp-healthcheck.service"
+
+# Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
+# Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
+# Используем системный сокет Debian/Ubuntu: 127.0.2.1:53 (socket activation)
+# Это работает "из коробки" — не боремся с systemd
+DNS_PROXY_ADDR="127.0.2.1"
+DNS_PROXY_PORT=53
+DNS_PROXY_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
+DNS_PROXY_STATE="/etc/dnscrypt-proxy/awg.state"
+DNS_PROXY_BACKUP_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml.awg-backup"
+DNS_PERSIST_SERVICE="/etc/systemd/system/awg-dns-persist.service"
+DNS_PERSIST_SCRIPT="/usr/local/bin/awg-dns-persist.sh"
+DNS_HEALTH_SERVICE="/etc/systemd/system/awg-dns-healthcheck.service"
+DNS_HEALTH_TIMER="/etc/systemd/system/awg-dns-healthcheck.timer"
+DNS_HEALTH_SCRIPT="/usr/local/bin/awg-dns-healthcheck.sh"
+DNS_HEALTH_LOG="/var/log/awg-dns-health.log"
 
 # ── Логирование ────────────────────────────────────────────
 _log() {
@@ -1144,7 +1160,7 @@ do_self_update() {
   echo -e "  ${W}Новая    : ${N}$new_ver"
   echo ""
 
-  # Сравниваем версии (vX.Y → числа). Если на GitHub старше или такая же — спрашиваем.
+  # Сравниваем версии (vX.Y.Z → числа). Если на GitHub старше или такая же — спрашиваем.
   local cur_num new_num
   cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
   new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
@@ -1327,6 +1343,19 @@ show_menu() {
   fi
 
   echo ""
+
+  # === ШИФРОВАННЫЙ DNS ===
+  echo -e "  ${C}▸ Шифрованный DNS:${N}"
+  if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
+     iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
+    echo -e "  ${C}16)${N} DNS-шифрование  ${G}● включено${N} ${D}(DoH через Cloudflare/Google/Quad9)${N}"
+  elif command -v dnscrypt-proxy &>/dev/null; then
+    echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
+  else
+    echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ не настроен${N}"
+  fi
+
+  echo ""
   echo -e "  ${W}0)${N} Выход"
   echo ""
   read -rp "$(echo -e "${C}  Выбор: ${N}")" CHOICE
@@ -1335,6 +1364,17 @@ show_menu() {
 choose_dns() {
   CLIENT_DNS=""
   hdr "◎  DNS для клиента"
+  echo ""
+
+  # Если включено DNS-шифрование (пункт 16) — показать подсказку
+  if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
+     iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
+    echo -e "  ${G}⚡ Шифрованный DNS включён${N} ${D}(пункт 16 главного меню)${N}"
+    echo -e "  ${D}→ Любой выбор будет автоматически перенаправлен через DoH${N}"
+    echo -e "  ${D}→ Реальные запросы пойдут через Cloudflare/Google/Quad9${N}"
+    echo ""
+  fi
+
   echo "  1) Cloudflare  — 1.1.1.1, 1.0.0.1"
   echo "  2) Google      — 8.8.8.8, 8.8.4.4"
   echo "  3) OpenDNS     — 208.67.222.222, 208.67.220.220"
@@ -1606,10 +1646,62 @@ EOF
   apt-get install -y -q "${base_deps[@]}"
 
   hdr "+  Kernel headers"
-  apt-get install -y -q "linux-headers-$(uname -r)" 2>/dev/null || \
-  apt-get install -y -q linux-headers-generic || \
-  apt-get install -y -q linux-headers-amd64 || \
-  { err "Не удалось установить linux-headers"; info "Попробуй: apt-get install linux-headers-generic"; prompt_retry || return 1; continue; }
+  local running_kernel
+  running_kernel="$(uname -r)"
+  info "Running kernel: $running_kernel"
+
+  # Проверяем — есть ли headers для running kernel
+  local headers_ok=0
+  if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
+    info "Headers уже установлены"
+    headers_ok=1
+  else
+    # Пытаемся установить headers под running kernel
+    info "Устанавливаем linux-headers-${running_kernel}..."
+    if apt-get install -y -q "linux-headers-${running_kernel}" 2>&1 | tail -3; then
+      if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
+        ok "Headers установлены"
+        headers_ok=1
+      fi
+    fi
+  fi
+
+  # Если headers всё ещё нет — пробуем мета-пакеты
+  if [[ $headers_ok -eq 0 ]]; then
+    apt-get install -y -q linux-headers-amd64 2>/dev/null || \
+    apt-get install -y -q linux-headers-generic 2>/dev/null || true
+
+    if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
+      headers_ok=1
+    fi
+  fi
+
+  # Если headers всё равно нет — возможно ядро обновилось, нужен reboot
+  if [[ $headers_ok -eq 0 ]]; then
+    err "Kernel headers для ${running_kernel} не найдены"
+    echo ""
+    # Проверяем — есть ли headers под ДРУГУЮ версию ядра (значит был upgrade)
+    local installed_headers
+    installed_headers=$(ls /lib/modules/ 2>/dev/null | grep -v "$running_kernel" | head -3)
+    if [[ -n "$installed_headers" ]]; then
+      warn "Обнаружены headers под другие ядра:"
+      echo "$installed_headers" | while read k; do echo "    /lib/modules/$k"; done
+      echo ""
+      warn "Скорее всего ядро было обновлено через apt upgrade"
+      warn "Нужен REBOOT чтобы загрузилось новое ядро с headers"
+      echo ""
+      info "Команды для решения:"
+      info "  1) sudo reboot          # перезагрузка"
+      info "  2) sudo awg2 → 1        # повторить установку после reboot"
+    else
+      info "Попробуй вручную:"
+      info "  sudo apt update"
+      info "  sudo apt install linux-headers-\$(uname -r)"
+      info "  sudo apt install linux-headers-amd64"
+    fi
+    prompt_retry || return 1; continue
+  fi
+  ok "Kernel headers готовы для ${running_kernel}"
 
   # AmneziaWG kernel module + tools через git+DKMS (стабильнее PPA)
   hdr "+  AmneziaWG kernel module (git + DKMS)"
@@ -1628,7 +1720,20 @@ EOF
     dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
     dkms build -m amneziawg -v "$mod_ver" || exit 1
     dkms install -m amneziawg -v "$mod_ver" || exit 1
-  ) || { err "Сборка kernel module провалилась"; prompt_retry || return 1; continue; }
+  ) || {
+    err "Сборка kernel module провалилась"
+    echo ""
+    info "Возможные причины:"
+    info "  • Headers не соответствуют running kernel ($(uname -r))"
+    info "  • Ядро было обновлено, требуется reboot"
+    info "  • Нет интернета для git clone"
+    echo ""
+    info "Проверка:"
+    info "  ls /lib/modules/$(uname -r)/build  # должна существовать"
+    info "  uname -r                            # текущее ядро"
+    info "  dkms status                         # состояние DKMS"
+    prompt_retry || return 1; continue
+  }
   rm -rf "$tmp_mod"
 
   hdr "+  amneziawg-tools (git + make)"
@@ -4167,6 +4272,743 @@ do_warp_menu() {
   done
   set -e
 }
+
+
+# ── Шифрованный DNS (dnscrypt-proxy) — пункт меню 16 ────────────
+
+# Проверка статуса dnscrypt-proxy
+_dns_proxy_status() {
+  if ! command -v dnscrypt-proxy &>/dev/null; then
+    echo -e "  Статус     : ${D}○ не установлен${N}"
+    return 1
+  fi
+  if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+    echo -e "  Статус     : ${G}● активен${N}"
+    # DNAT IPv4
+    if iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null; then
+      echo -e "  DNAT IPv4  : ${G}● настроен${N} ${D}(awg0 → ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT})${N}"
+    else
+      echo -e "  DNAT IPv4  : ${R}✗ правило отсутствует${N}"
+    fi
+    # DoT блокировка
+    if iptables -C FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null; then
+      echo -e "  DoT block  : ${G}● заблокирован${N} ${D}(порт 853)${N}"
+    else
+      echo -e "  DoT block  : ${D}○ не настроен${N}"
+    fi
+    # IPv6 блокировка
+    if command -v ip6tables &>/dev/null && ip6tables -C FORWARD -i awg0 -p udp --dport 53 -j DROP 2>/dev/null; then
+      echo -e "  IPv6 leak  : ${G}● закрыт${N}"
+    else
+      echo -e "  IPv6 leak  : ${D}○ не настроен${N}"
+    fi
+    # Persistence
+    if systemctl is-enabled --quiet awg-dns-persist.service 2>/dev/null; then
+      echo -e "  Persist    : ${G}● переживёт reboot${N}"
+    else
+      echo -e "  Persist    : ${R}✗ DNAT исчезнет после reboot${N}"
+    fi
+    # Healthcheck
+    if systemctl is-active --quiet awg-dns-healthcheck.timer 2>/dev/null; then
+      local last_check
+      last_check=$(systemctl status awg-dns-healthcheck.timer 2>/dev/null | grep "Trigger:" | head -1 | sed 's/.*Trigger: //' || echo "?")
+      echo -e "  Healthcheck: ${G}● включён${N} ${D}(каждые 2 мин)${N}"
+    else
+      echo -e "  Healthcheck: ${D}○ выключен${N}"
+    fi
+    # Резолвер
+    if [[ -f "$DNS_PROXY_CONF" ]]; then
+      local servers
+      servers=$(grep -E "^server_names" "$DNS_PROXY_CONF" 2>/dev/null | head -1 | sed "s/server_names\s*=\s*//; s/\[//; s/\]//" | tr -d "'\"")
+      [[ -n "$servers" ]] && echo -e "  Резолверы  : ${C}${servers}${N}"
+    fi
+  else
+    echo -e "  Статус     : ${D}○ выключен (установлен)${N}"
+  fi
+  return 0
+}
+
+# Установка и настройка dnscrypt-proxy
+_dns_proxy_install() {
+  echo ""
+  hdr "+  Установка dnscrypt-proxy"
+
+  # ───── PRE-CHECKS — проверки перед установкой ─────
+  info "Выполняем pre-checks..."
+
+  # 1. AWG интерфейс существует
+  if ! ip link show awg0 &>/dev/null; then
+    err "Интерфейс awg0 не найден"
+    info "Сначала установи AWG (пункт 2 главного меню), затем включи DNS-шифрование"
+    return 1
+  fi
+
+  # 2. Проверка конфликтующих DNS-сервисов на 53 порту
+  # systemd-resolved слушает на 127.0.0.53 — это OK
+  # А вот pi-hole / unbound / bind / powerdns на 0.0.0.0:53 — конфликт
+  local conflicting_dns=""
+  if ss -tulpn 2>/dev/null | grep -E ':(53|853)\s' | grep -v "127.0.0.53\|127.0.2.1" | head -3 | grep -q .; then
+    conflicting_dns=$(ss -tulpn 2>/dev/null | grep -E ':(53|853)\s' | grep -v "127.0.0.53\|127.0.2.1" | head -3)
+    warn "На сервере уже работают DNS-сервисы:"
+    echo "$conflicting_dns" | while read line; do echo "    $line"; done
+    echo ""
+    warn "Это может вызвать конфликты. Возможные причины:"
+    info "  • Pi-hole / Unbound / BIND / PowerDNS"
+    info "  • Другая инсталляция dnscrypt-proxy"
+    echo ""
+    read -rp "$(echo -e "  ${Y}Продолжить установку всё равно? [y/N]: ${N}")" CONT_INSTALL
+    if [[ ! "${CONT_INSTALL,,}" =~ ^y ]]; then
+      warn "Отменено"
+      return 1
+    fi
+  fi
+
+  ok "Pre-checks пройдены"
+  echo ""
+
+  # ───── 1. Установка пакета ─────
+  if ! command -v dnscrypt-proxy &>/dev/null; then
+    info "Устанавливаем dnscrypt-proxy + dnsutils..."
+    if ! apt-get install -y -q dnscrypt-proxy dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -5; then
+      err "Не удалось установить dnscrypt-proxy"
+      info "Попробуй: apt-get update && apt-get install dnscrypt-proxy"
+      return 1
+    fi
+    ok "dnscrypt-proxy установлен"
+  else
+    info "dnscrypt-proxy уже установлен"
+    if ! command -v dig &>/dev/null; then
+      apt-get install -y -q dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -3 || true
+    fi
+  fi
+
+  # ───── 2. Бекап оригинального конфига ─────
+  if [[ -f "$DNS_PROXY_CONF" ]] && [[ ! -f "$DNS_PROXY_BACKUP_CONF" ]]; then
+    cp "$DNS_PROXY_CONF" "$DNS_PROXY_BACKUP_CONF"
+    info "Оригинальный конфиг сохранён: $DNS_PROXY_BACKUP_CONF"
+  fi
+
+  systemctl stop dnscrypt-proxy 2>/dev/null || true
+
+  # 4. Создаём наш конфиг
+  # Важно: НЕ задаём listen_addresses — на Debian/Ubuntu используется
+  # systemd socket activation (127.0.2.1:53). Если задать listen_addresses,
+  # появляется конфликт с сокетом и сервис может не работать.
+  info "Создаём конфиг с DoH резолверами..."
+  mkdir -p /etc/dnscrypt-proxy
+
+  cat > "$DNS_PROXY_CONF" << EOF
+# AWG Toolza — шифрованный DNS через DoH
+# Адрес: ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT} (через systemd socket activation)
+
+# listen_addresses пустой — используем systemd сокет (Debian/Ubuntu default)
+listen_addresses = []
+
+# Параметры безопасности
+require_dnssec = true
+require_nolog = true
+require_nofilter = true
+
+# Резолверы (DoH only — стабильнее DNSCrypt)
+server_names = ['cloudflare', 'google', 'quad9-doh-ip4-port443']
+
+dnscrypt_servers = false
+doh_servers = true
+
+# IPv4 only
+ipv4_servers = true
+ipv6_servers = false
+
+# Кеш
+cache = true
+cache_size = 4096
+cache_min_ttl = 2400
+cache_max_ttl = 86400
+
+# Тайминги
+timeout = 5000
+keepalive = 30
+
+# Источники
+[sources]
+  [sources.public-resolvers]
+    urls = ['https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md', 'https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md']
+    cache_file = '/var/cache/dnscrypt-proxy/public-resolvers.md'
+    minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+    refresh_delay = 73
+    prefix = ''
+EOF
+
+  chmod 644 "$DNS_PROXY_CONF"
+  mkdir -p /var/cache/dnscrypt-proxy
+  chown -R _dnscrypt-proxy:_dnscrypt-proxy /var/cache/dnscrypt-proxy 2>/dev/null || \
+    chown -R nobody:nogroup /var/cache/dnscrypt-proxy 2>/dev/null || true
+
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    info "systemd-resolved активен — это OK (мы на ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT})"
+  fi
+
+  # 5. Запускаем dnscrypt-proxy через systemd socket
+  info "Запускаем dnscrypt-proxy..."
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable dnscrypt-proxy.socket 2>/dev/null || true
+  systemctl enable dnscrypt-proxy 2>/dev/null || true
+  systemctl start dnscrypt-proxy.socket 2>/dev/null || true
+  systemctl start dnscrypt-proxy 2>/dev/null || true
+
+  # 6. Ждём пока резолверы загрузятся (до 15 секунд)
+  info "Ждём пока загрузятся резолверы..."
+  local waited=0
+  local ready=0
+  while [[ $waited -lt 15 ]]; do
+    sleep 1
+    waited=$((waited+1))
+    if ! systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+      continue
+    fi
+    # Тестовый запрос на адрес сокета
+    if timeout 3 dig "@${DNS_PROXY_ADDR}" -p "${DNS_PROXY_PORT}" cloudflare.com +short +tries=1 +time=2 2>/dev/null | grep -qE '^[0-9]+\.'; then
+      ready=1
+      break
+    fi
+    printf "."
+  done
+  echo ""
+
+  # 7. Проверка результата
+  if ! systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+    err "dnscrypt-proxy не запустился"
+    echo ""
+    info "Последние строки лога:"
+    journalctl -u dnscrypt-proxy -n 15 --no-pager 2>/dev/null | tail -15
+    return 1
+  fi
+
+  if [[ $ready -eq 0 ]]; then
+    err "Резолвер не отвечает после 15 секунд"
+    echo ""
+    info "Возможные причины:"
+    info "  • Cloudflare DoH недоступен с этого сервера (РФ хостинги)"
+    info "  • Bootstrap DNS (9.9.9.9 / 8.8.8.8) не отвечает"
+    echo ""
+    info "Лог:"
+    journalctl -u dnscrypt-proxy -n 15 --no-pager 2>/dev/null | tail -15
+    echo ""
+    info "Проверь вручную:"
+    info "  dig @${DNS_PROXY_ADDR} cloudflare.com"
+    info "  ss -tulpn | grep ':${DNS_PROXY_PORT} '"
+    return 1
+  fi
+
+  ok "dnscrypt-proxy запущен и отвечает на ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT} (за ${waited} сек)"
+
+  # ───── 8. iptables DNAT (IPv4) ─────
+  info "Настраиваем iptables DNAT IPv4 для awg0 → ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}..."
+
+  # Удаляем старые правила (если были)
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+
+  # Добавляем DNAT
+  iptables -t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}"
+  iptables -t nat -A PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}"
+
+  # ───── 8.5. Разрешаем DNAT-перенаправленные пакеты к dnscrypt ─────
+  # КРИТИЧНО: UFW по умолчанию блокирует пакеты awg0 → 127.0.2.1:53
+  info "Разрешаем DNAT-пакеты к dnscrypt..."
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    # UFW активен — используем родные UFW правила (persist автоматически)
+    ufw allow in on awg0 to "${DNS_PROXY_ADDR}" port "${DNS_PROXY_PORT}" proto udp >/dev/null 2>&1
+    ufw allow in on awg0 to "${DNS_PROXY_ADDR}" port "${DNS_PROXY_PORT}" proto tcp >/dev/null 2>&1
+    ufw reload >/dev/null 2>&1
+    info "  → Используется UFW (правила сохранятся автоматически)"
+  else
+    # UFW не активен — обычный iptables -I INPUT
+    while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p tcp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+    iptables -I INPUT 1 -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT
+    iptables -I INPUT 1 -i awg0 -d "${DNS_PROXY_ADDR}" -p tcp --dport "${DNS_PROXY_PORT}" -j ACCEPT
+    info "  → Используется iptables (UFW не активен)"
+  fi
+  ok "DNAT-пакеты разрешены"
+
+  # ───── 9. iptables DROP — блокировка обхода ─────
+  info "Блокируем обход DNS-шифрования (DoT 853, нестандартные DoH)..."
+  # DoT (DNS-over-TLS) — порт 853 — блокируем чтобы клиент не обошёл
+  iptables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+  iptables -D FORWARD -i awg0 -p udp --dport 853 -j DROP 2>/dev/null || true
+  iptables -A FORWARD -i awg0 -p tcp --dport 853 -j DROP
+  iptables -A FORWARD -i awg0 -p udp --dport 853 -j DROP
+
+  # ───── 10. ip6tables — IPv6 закрытие leak ─────
+  if command -v ip6tables &>/dev/null; then
+    info "Закрываем IPv6 DNS-leak..."
+    # Блокируем весь IPv6 DNS трафик из awg0 (у нас VPN IPv4-only)
+    ip6tables -D FORWARD -i awg0 -p udp --dport 53 -j DROP 2>/dev/null || true
+    ip6tables -D FORWARD -i awg0 -p tcp --dport 53 -j DROP 2>/dev/null || true
+    ip6tables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+    ip6tables -A FORWARD -i awg0 -p udp --dport 53 -j DROP
+    ip6tables -A FORWARD -i awg0 -p tcp --dport 53 -j DROP
+    ip6tables -A FORWARD -i awg0 -p tcp --dport 853 -j DROP
+  fi
+
+  # route_localnet=1 — обязательно для DNAT в 127.0.0.0/8
+  sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+
+  cat > /etc/sysctl.d/99-awg-dns.conf << EOF
+# AWG Toolza: route_localnet для DNAT 53 → ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}
+net.ipv4.conf.all.route_localnet=1
+EOF
+
+  ok "iptables правила добавлены (DNAT + DoT block + IPv6 block)"
+
+  # ───── 11. Persist iptables через systemd unit ─────
+  info "Настраиваем persistence для iptables (переживёт reboot)..."
+
+  cat > "$DNS_PERSIST_SCRIPT" << EOF
+#!/usr/bin/env bash
+# AWG Toolza — восстановление iptables правил для DNS-шифрования при старте
+# Создан автоматически: $(date '+%Y-%m-%d %H:%M:%S')
+
+set -e
+
+# Ждём пока awg0 поднимется
+for i in {1..30}; do
+  if ip link show awg0 &>/dev/null; then
+    break
+  fi
+  sleep 2
+done
+
+if ! ip link show awg0 &>/dev/null; then
+  echo "[awg-dns-persist] awg0 не появился за 60 секунд, выход" >&2
+  exit 1
+fi
+
+# Удаляем старые правила (на случай если уже есть)
+iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+iptables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+iptables -D FORWARD -i awg0 -p udp --dport 853 -j DROP 2>/dev/null || true
+while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p tcp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+
+# IPv4 DNAT
+iptables -t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}"
+iptables -t nat -A PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}"
+
+# INPUT allow — обход UFW для DNAT-перенаправленных пакетов
+# Если UFW активен — он сам сохраняет свои правила, скипаем
+if ! (command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"); then
+  iptables -I INPUT 1 -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT
+  iptables -I INPUT 1 -i awg0 -d "${DNS_PROXY_ADDR}" -p tcp --dport "${DNS_PROXY_PORT}" -j ACCEPT
+fi
+
+# DoT block
+iptables -A FORWARD -i awg0 -p tcp --dport 853 -j DROP
+iptables -A FORWARD -i awg0 -p udp --dport 853 -j DROP
+
+# IPv6 block (DNS + DoT)
+if command -v ip6tables &>/dev/null; then
+  ip6tables -D FORWARD -i awg0 -p udp --dport 53 -j DROP 2>/dev/null || true
+  ip6tables -D FORWARD -i awg0 -p tcp --dport 53 -j DROP 2>/dev/null || true
+  ip6tables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+  ip6tables -A FORWARD -i awg0 -p udp --dport 53 -j DROP
+  ip6tables -A FORWARD -i awg0 -p tcp --dport 53 -j DROP
+  ip6tables -A FORWARD -i awg0 -p tcp --dport 853 -j DROP
+fi
+
+echo "[awg-dns-persist] DNS iptables правила восстановлены"
+EOF
+  chmod +x "$DNS_PERSIST_SCRIPT"
+
+  cat > "$DNS_PERSIST_SERVICE" << EOF
+[Unit]
+Description=AWG Toolza — DNS iptables persistence
+After=network-online.target dnscrypt-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$DNS_PERSIST_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable awg-dns-persist.service 2>/dev/null
+
+  ok "Persistence настроена (правила восстановятся после reboot)"
+
+  # ───── 12. Healthcheck timer ─────
+  info "Настраиваем healthcheck (мониторинг dnscrypt-proxy)..."
+
+  cat > "$DNS_HEALTH_SCRIPT" << EOF
+#!/usr/bin/env bash
+# AWG Toolza — healthcheck для dnscrypt-proxy
+# Проверяет что сервис активен и резолвит. Если упал — пишет в лог.
+
+LOG="$DNS_HEALTH_LOG"
+TIMESTAMP=\$(date '+%Y-%m-%d %H:%M:%S')
+
+# 1. Проверка сервиса
+if ! systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+  echo "[\$TIMESTAMP] FAIL: dnscrypt-proxy сервис не активен" >> "\$LOG"
+  # Пробуем перезапустить
+  systemctl restart dnscrypt-proxy 2>/dev/null && \\
+    echo "[\$TIMESTAMP] RECOVERY: автоматически перезапустили dnscrypt-proxy" >> "\$LOG"
+  exit 1
+fi
+
+# 2. Проверка реального резолва (через dig)
+if command -v dig &>/dev/null; then
+  if ! timeout 3 dig "@${DNS_PROXY_ADDR}" -p "${DNS_PROXY_PORT}" cloudflare.com +short +tries=1 +time=2 2>/dev/null | grep -qE '^[0-9]+\.'; then
+    echo "[\$TIMESTAMP] FAIL: dnscrypt-proxy не резолвит cloudflare.com" >> "\$LOG"
+    exit 1
+  fi
+fi
+
+# 3. Проверка DNAT правил
+if ! iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null; then
+  echo "[\$TIMESTAMP] FAIL: DNAT правило отсутствует — восстанавливаю" >> "\$LOG"
+  $DNS_PERSIST_SCRIPT 2>&1 | tee -a "\$LOG" >/dev/null
+fi
+
+exit 0
+EOF
+  chmod +x "$DNS_HEALTH_SCRIPT"
+
+  cat > "$DNS_HEALTH_SERVICE" << EOF
+[Unit]
+Description=AWG Toolza — DNS healthcheck
+After=dnscrypt-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=$DNS_HEALTH_SCRIPT
+EOF
+
+  cat > "$DNS_HEALTH_TIMER" << EOF
+[Unit]
+Description=AWG Toolza — DNS healthcheck (каждые 2 мин)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+Unit=awg-dns-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  touch "$DNS_HEALTH_LOG"
+  systemctl daemon-reload
+  systemctl enable --now awg-dns-healthcheck.timer 2>/dev/null
+
+  ok "Healthcheck настроен (проверка каждые 2 минуты, лог: $DNS_HEALTH_LOG)"
+
+  # ───── 13. State ─────
+  cat > "$DNS_PROXY_STATE" << EOF
+enabled=true
+addr=${DNS_PROXY_ADDR}
+port=${DNS_PROXY_PORT}
+ipv6_blocked=true
+dot_blocked=true
+persist_enabled=true
+healthcheck_enabled=true
+installed_at=$(date +%s)
+EOF
+
+  echo ""
+  ok "Шифрованный DNS активен!"
+  info "Защита от DNS-leak:"
+  info "  ✓ DNAT перехват UDP/TCP 53 на awg0"
+  info "  ✓ DoT (порт 853) заблокирован"
+  info "  ✓ IPv6 DNS заблокирован"
+  info "  ✓ Persistence через systemd (переживёт reboot)"
+  info "  ✓ Healthcheck каждые 2 минуты"
+  echo ""
+  info "Проверка с клиента: https://1.1.1.1/help → 'Using DNS over HTTPS' = Yes"
+  return 0
+}
+
+
+# Удаление DNAT и (опционально) пакета
+_dns_proxy_remove() {
+  echo ""
+  hdr "−  Удаление шифрованного DNS"
+  echo ""
+  echo -e "  Что будет удалено:"
+  echo -e "  ${R}•${N} DNAT правила для awg0 (DNS снова напрямую к 1.1.1.1)"
+  echo -e "  ${R}•${N} Блокировка DoT (порт 853)"
+  echo -e "  ${R}•${N} Блокировка IPv6 DNS"
+  echo -e "  ${R}•${N} Sysctl правило route_localnet"
+  echo -e "  ${R}•${N} Persistence (systemd unit) и Healthcheck (timer)"
+  echo -e "  ${R}•${N} Сервис dnscrypt-proxy будет ${Y}остановлен${N}"
+  echo ""
+  read -rp "$(echo -e "  Также ${R}полностью удалить пакет${N} dnscrypt-proxy? [y/N]: ")" REMOVE_PKG
+
+  # 1. Healthcheck timer
+  systemctl disable --now awg-dns-healthcheck.timer 2>/dev/null || true
+  systemctl stop awg-dns-healthcheck.service 2>/dev/null || true
+  rm -f "$DNS_HEALTH_TIMER" "$DNS_HEALTH_SERVICE" "$DNS_HEALTH_SCRIPT" "$DNS_HEALTH_LOG"
+
+  # 2. Persist service
+  systemctl disable awg-dns-persist.service 2>/dev/null || true
+  rm -f "$DNS_PERSIST_SERVICE" "$DNS_PERSIST_SCRIPT"
+
+  systemctl daemon-reload 2>/dev/null || true
+
+  # 3. iptables IPv4 DNAT — убираем все варианты
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+  # Старые правила (для совместимости с прошлыми версиями)
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+
+  # 4. iptables — DoT блокировка
+  iptables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+  iptables -D FORWARD -i awg0 -p udp --dport 853 -j DROP 2>/dev/null || true
+
+  # 4.5. INPUT allow rules — убираем и UFW и iptables варианты
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow in on awg0 to "${DNS_PROXY_ADDR}" port "${DNS_PROXY_PORT}" proto udp >/dev/null 2>&1 || true
+    ufw delete allow in on awg0 to "${DNS_PROXY_ADDR}" port "${DNS_PROXY_PORT}" proto tcp >/dev/null 2>&1 || true
+    ufw reload >/dev/null 2>&1 || true
+  fi
+  # И iptables на всякий случай (если правила были добавлены до активации UFW)
+  while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+  while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p tcp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
+
+  # 5. ip6tables — IPv6 блокировка
+  if command -v ip6tables &>/dev/null; then
+    ip6tables -D FORWARD -i awg0 -p udp --dport 53 -j DROP 2>/dev/null || true
+    ip6tables -D FORWARD -i awg0 -p tcp --dport 53 -j DROP 2>/dev/null || true
+    ip6tables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
+  fi
+
+  ok "Все iptables правила удалены"
+
+  # 6. Sysctl
+  rm -f /etc/sysctl.d/99-awg-dns.conf
+  sysctl -w net.ipv4.conf.all.route_localnet=0 >/dev/null 2>&1 || true
+
+  # 7. Сервис
+  systemctl stop dnscrypt-proxy 2>/dev/null || true
+  systemctl disable dnscrypt-proxy 2>/dev/null || true
+  ok "Сервис dnscrypt-proxy остановлен"
+
+  # 8. Полное удаление пакета (если запросил)
+  if [[ "${REMOVE_PKG,,}" =~ ^y ]]; then
+    info "Удаляем пакет dnscrypt-proxy..."
+    apt-get purge -y -q dnscrypt-proxy 2>&1 | tail -3
+    rm -rf /var/cache/dnscrypt-proxy
+    ok "Пакет удалён"
+  else
+    # 9. Восстанавливаем оригинальный конфиг если есть бекап
+    if [[ -f "$DNS_PROXY_BACKUP_CONF" ]]; then
+      cp "$DNS_PROXY_BACKUP_CONF" "$DNS_PROXY_CONF" 2>/dev/null
+      info "Оригинальный конфиг восстановлен из $DNS_PROXY_BACKUP_CONF"
+    fi
+  fi
+
+  # 10. State
+  rm -f "$DNS_PROXY_STATE"
+
+  echo ""
+  ok "Шифрованный DNS отключён"
+  info "DNS клиентов снова идёт напрямую (DNS из их конфига)"
+  return 0
+}
+
+# Перезапуск сервиса
+_dns_proxy_restart() {
+  if ! systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+    err "dnscrypt-proxy не запущен"
+    return 1
+  fi
+  info "Перезапускаем dnscrypt-proxy..."
+  systemctl restart dnscrypt-proxy
+  sleep 2
+  if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+    ok "Сервис перезапущен"
+  else
+    err "Сервис упал — проверь journalctl -u dnscrypt-proxy"
+    return 1
+  fi
+  return 0
+}
+
+# Просмотр логов
+_dns_proxy_logs() {
+  echo ""
+  hdr "📜  Логи dnscrypt-proxy (последние 50 строк)"
+  echo ""
+  journalctl -u dnscrypt-proxy -n 50 --no-pager 2>/dev/null || warn "Логи недоступны"
+}
+
+# Смена upstream резолверов
+_dns_proxy_change_upstream() {
+  if [[ ! -f "$DNS_PROXY_CONF" ]]; then
+    err "Конфиг не найден — сначала установи (пункт 1)"
+    return 1
+  fi
+
+  echo ""
+  hdr "↻  Сменить upstream резолверы"
+  echo ""
+  echo -e "  ${G}1)${N} Cloudflare + Google + Quad9 ${D}(по умолчанию, рекомендуется)${N}"
+  echo -e "  ${G}2)${N} Только Cloudflare ${D}(быстрее, один источник)${N}"
+  echo -e "  ${G}3)${N} Cloudflare + Quad9 ${D}(без Google — privacy-focused)${N}"
+  echo -e "  ${G}4)${N} Только Quad9 ${D}(швейцарский, no-logging)${N}"
+  echo -e "  ${G}5)${N} Только Google ${D}(если CF/Q9 заблокированы)${N}"
+  echo -e "  ${C}6) Ввести вручную${N} ${D}(произвольный список из public-resolvers.md)${N}"
+  echo -e "  ${G}0)${N} Отмена"
+  echo ""
+  read -rp "  Выбор: " UPSTREAM_CHOICE
+
+  local servers=""
+  case "${UPSTREAM_CHOICE:-}" in
+    1) servers="['cloudflare', 'google', 'quad9-doh-ip4-port443']" ;;
+    2) servers="['cloudflare']" ;;
+    3) servers="['cloudflare', 'quad9-doh-ip4-port443']" ;;
+    4) servers="['quad9-doh-ip4-port443']" ;;
+    5) servers="['google']" ;;
+    6)
+      echo ""
+      echo -e "  ${W}Доступные резолверы:${N} полный список в public-resolvers.md"
+      echo -e "  ${D}https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md${N}"
+      echo ""
+      echo -e "  ${W}Примеры популярных DoH серверов:${N}"
+      echo -e "  ${C}cloudflare${N}                   — 1.1.1.1 / 1.0.0.1"
+      echo -e "  ${C}cloudflare-security${N}          — Cloudflare с фильтром malware"
+      echo -e "  ${C}cloudflare-family${N}            — Cloudflare с фильтром adult"
+      echo -e "  ${C}google${N}                       — 8.8.8.8 / 8.8.4.4"
+      echo -e "  ${C}quad9-doh-ip4-port443${N}        — Quad9 (no-filter)"
+      echo -e "  ${C}quad9-doh-ip4-port443-filter-pri${N} — Quad9 (security filter)"
+      echo -e "  ${C}adguard-dns-doh${N}              — AdGuard (фильтр рекламы)"
+      echo -e "  ${C}nextdns-XXXXXX${N}               — NextDNS (нужна регистрация)"
+      echo -e "  ${C}mullvad-doh${N}                  — Mullvad (no-logging)"
+      echo -e "  ${C}controld-uncensored${N}          — Control D"
+      echo ""
+      echo -e "  ${Y}⚠ Внимание:${N} если выбрать ${R}filter${N}-резолвер,"
+      echo -e "  отключи ${C}require_nofilter${N} в конфиге, иначе сервер не запустится."
+      echo ""
+      echo -e "  ${W}Введи через запятую:${N} ${D}cloudflare,google${N}"
+      echo -e "  ${W}Или один:${N} ${D}quad9-doh-ip4-port443${N}"
+      echo ""
+      read -rp "  Резолверы: " MANUAL_INPUT
+
+      if [[ -z "$MANUAL_INPUT" ]]; then
+        warn "Пусто — отменено"
+        return 0
+      fi
+
+      # Валидация: только буквы/цифры/дефисы/запятые/пробелы
+      if [[ ! "$MANUAL_INPUT" =~ ^[a-zA-Z0-9_,\ -]+$ ]]; then
+        err "Недопустимые символы. Разрешены: a-z, 0-9, дефис, запятая"
+        return 1
+      fi
+
+      # Разбираем CSV → массив → TOML список
+      local IFS_OLD="$IFS"
+      IFS=','
+      local arr=()
+      for srv in $MANUAL_INPUT; do
+        # Убираем пробелы по краям
+        srv="${srv## }"; srv="${srv%% }"
+        srv="${srv#"${srv%%[![:space:]]*}"}"
+        srv="${srv%"${srv##*[![:space:]]}"}"
+        [[ -n "$srv" ]] && arr+=("'$srv'")
+      done
+      IFS="$IFS_OLD"
+
+      if [[ ${#arr[@]} -eq 0 ]]; then
+        err "Не удалось распарсить список"
+        return 1
+      fi
+
+      # Собираем TOML формат: ['srv1', 'srv2']
+      servers="[$(IFS=', '; echo "${arr[*]}")]"
+
+      # Если в списке есть filter-резолвер — предупреждаем про require_nofilter
+      if echo "$MANUAL_INPUT" | grep -q "filter"; then
+        warn "В списке есть фильтрующий резолвер."
+        warn "Меняю require_nofilter с true на false (иначе сервер не запустится)"
+        sed -i 's|^require_nofilter\s*=.*|require_nofilter = false|' "$DNS_PROXY_CONF"
+      fi
+      ;;
+    0|"") return 0 ;;
+    *) warn "Неверный выбор"; return 1 ;;
+  esac
+
+  sed -i "s|^server_names\s*=.*|server_names = $servers|" "$DNS_PROXY_CONF"
+  ok "Upstream обновлён: $servers"
+
+  _dns_proxy_restart
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    err "Сервис не запустился — возможно неверное имя резолвера"
+    info "Проверь имена в public-resolvers.md и попробуй снова"
+    info "Или сделай 'sudo journalctl -u dnscrypt-proxy -n 20' чтобы увидеть лог"
+  fi
+  return $rc
+}
+
+# Меню шифрованного DNS — пункт 16
+do_dns_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "☁  Шифрованный DNS (DNSCrypt-proxy)"
+    echo ""
+    _dns_proxy_status || true
+    echo ""
+    echo -e "  ${D}При включении: все DNS-запросы клиентов идут через DoH${N}"
+    echo -e "  ${D}к Cloudflare / Google / Quad9 (DNSSEC + no-logging)${N}"
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Включить (установить + настроить)"
+    echo -e "  2) Перезапустить сервис"
+    echo -e "  3) Логи (последние 50 строк)"
+    echo -e "  4) Сменить upstream (Cloudflare / Google / Quad9)"
+    echo -e "  ${R}5) Выключить и удалить${N}"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    read -rp "  Выбор [0-5]: " DNS_CHOICE
+
+    case "${DNS_CHOICE:-}" in
+      1)
+        # Проверим что AWG установлен
+        if ! ip link show awg0 &>/dev/null; then
+          warn "Сначала создай AWG сервер (пункт 2 главного меню)"
+          read -rp "Enter..."
+          continue
+        fi
+        _dns_proxy_install
+        read -rp "Enter..."
+        ;;
+      2) _dns_proxy_restart; read -rp "Enter..." ;;
+      3) _dns_proxy_logs; read -rp "Enter..." ;;
+      4) _dns_proxy_change_upstream; read -rp "Enter..." ;;
+      5) _dns_proxy_remove; read -rp "Enter..." ;;
+      0|"")
+        set -e
+        return 0
+        ;;
+      *) warn "Неверный выбор"; sleep 1 ;;
+    esac
+  done
+  set -e
+}
+
+
 do_uninstall() {
   echo ""
   hdr "⌧  Удаление AmneziaWG"
@@ -4633,6 +5475,7 @@ while true; do
     13)  do_repair ;;
     14)  do_self_update ;;
     15)  do_warp_menu ;;
+    16)  do_dns_menu ;;
     999) do_debug_cps ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
@@ -4651,7 +5494,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 15 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && { [[ "${CHOICE:-}" -le 16 ]] || [[ "${CHOICE:-}" == "999" ]]; }; then
     ERROR_COUNT=0
   fi
 
