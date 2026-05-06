@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.7.4-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.7.5-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -73,7 +73,7 @@ d) Удалить Warp полностью
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7.4                         ║
+║    AWG Toolza v6.7.5                         ║
 ║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
 ║              + Warp туннель Cloudflare       ║
 ╚══════════════════════════════════════════════╝
@@ -109,7 +109,36 @@ d) Удалить Warp полностью
   ▸ Warp туннель:
   15) Warp туннель  ● включен / ○ выключен / ○ не настроен
 
+  ▸ Шифрованный DNS:
+  16) DNS-шифрование  ● включено / ○ выключено / ○ не настроен
+
    0) Выход
+```
+
+---
+
+## 🔐 Шифрованный DNS (пункт 16)
+
+Все DNS-запросы клиентов идут через DoH (DNS-over-HTTPS) к Cloudflare / Google / Quad9 с проверкой DNSSEC.
+
+```
+Клиент → AWG → DNAT iptables → dnscrypt-proxy → DoH → Cloudflare/Google/Quad9
+                (порт 53)        (127.0.0.1:5300)        (HTTPS зашифрованно)
+```
+
+**Что даёт:**
+- Защита от DNS-leak (даже если в конфиге клиента указан 8.8.8.8 — запрос пойдёт через шифрованный канал)
+- Провайдер сервера не видит какие домены резолвятся
+- DNSSEC защищает от подмены ответов
+- No-logging резолверы
+
+**Меню (пункт 16):**
+```
+1) Включить (установить + настроить)
+2) Перезапустить сервис
+3) Логи
+4) Сменить upstream (Cloudflare / Google / Quad9 / комбинации)
+5) Выключить и удалить
 ```
 
 ## 🤖 Telegram бот
@@ -215,6 +244,6 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.7.4** · MIT License
+**AWG Toolza v6.7.5** · MIT License
 
 </div>
