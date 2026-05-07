@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.7.7"
+VERSION="v6.7.8"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -32,6 +32,19 @@ hdr()  {
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${W}$*${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+}
+
+# safe_read — сбрасывает буфер stdin перед read, чтобы случайные клавиши/повторы
+# не попадали в prompt. Особенно критично для подтверждений (yes/no для удаления).
+# Использование: safe_read VARNAME "Промпт: "
+safe_read() {
+  local _var_name="$1"
+  local _prompt="${2:-}"
+  # Сбрасываем буфер stdin (читаем всё что есть с timeout 0.05 сек)
+  # 2>/dev/null чтобы не выводить ошибки если буфер пуст
+  while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+  # Теперь читаем реальный ответ пользователя
+  read -rp "$_prompt" "$_var_name"
 }
 
 # Тематические хелперы
@@ -1111,6 +1124,13 @@ do_self_update() {
   echo ""
   hdr "⬇  Обновление скрипта"
 
+  # ───── 1. Проверка прав ─────
+  if [[ $EUID -ne 0 ]]; then
+    err "Обновление требует root прав"
+    info "Запусти: ${W}sudo awg2${N}"
+    return 1
+  fi
+
   # Куда установлен awg2 — ищем динамически
   local target="$SCRIPT_PATH"
   if [[ ! -f "$target" ]]; then
@@ -1118,22 +1138,48 @@ do_self_update() {
     target=$(readlink -f "$0" 2>/dev/null || echo "$0")
   fi
 
+  # Проверка возможности записи в target
+  if [[ ! -w "$target" ]] && [[ ! -w "$(dirname "$target")" ]]; then
+    err "Нет прав на запись в $target"
+    info "Проверь: ls -la $target"
+    return 1
+  fi
+
   info "URL: $UPDATE_URL"
   info "Файл: $target"
   echo ""
 
-  # Качаем во временный файл
+  # ───── 2. Скачивание с обходом CDN кеша ─────
   local tmp_file
   tmp_file=$(mktemp /tmp/awg2.new.XXXXXX) || { err "mktemp провалился"; return 1; }
 
-  if ! curl -fsSL --connect-timeout 10 --max-time 60 "$UPDATE_URL" -o "$tmp_file"; then
+  # Добавляем nocache параметр чтобы обойти GitHub CDN
+  # GitHub raw кеширует на 5 минут — без этого новый код не виден сразу после push
+  local fetch_url="${UPDATE_URL}?nocache=$(date +%s)"
+  info "Скачиваем (с обходом CDN кеша)..."
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 \
+       -H "Cache-Control: no-cache, no-store" \
+       -H "Pragma: no-cache" \
+       "$fetch_url" -o "$tmp_file"; then
     err "Не удалось скачать обновление"
     info "Проверь соединение или URL"
     rm -f "$tmp_file"
     return 1
   fi
 
-  # Базовая валидация скачанного: должен быть bash-скрипт
+  # ───── 3. Валидация скачанного ─────
+  # Проверка размера (минимум 50 КБ — наш скрипт ~200 КБ)
+  local tmp_size
+  tmp_size=$(stat -c%s "$tmp_file" 2>/dev/null || echo 0)
+  if [[ $tmp_size -lt 50000 ]]; then
+    err "Скачанный файл слишком мал ($tmp_size байт)"
+    info "Возможно сетевой сбой или GitHub отдал ошибку"
+    rm -f "$tmp_file"
+    return 1
+  fi
+  info "Скачано: $(echo "$tmp_size" | awk '{printf "%.1f KB", $1/1024}')"
+
+  # Должен быть bash-скрипт
   if ! head -1 "$tmp_file" | grep -q '^#!.*bash'; then
     err "Скачанный файл не похож на bash-скрипт"
     rm -f "$tmp_file"
@@ -1148,7 +1194,7 @@ do_self_update() {
     return 1
   fi
 
-  # Извлекаем версию из скачанного
+  # ───── 4. Извлечение версии ─────
   local new_ver
   new_ver=$(grep -m1 '^VERSION=' "$tmp_file" | cut -d'"' -f2)
   if [[ -z "$new_ver" ]]; then
@@ -1160,7 +1206,21 @@ do_self_update() {
   echo -e "  ${W}Новая    : ${N}$new_ver"
   echo ""
 
-  # Сравниваем версии (vX.Y.Z → числа). Если на GitHub старше или такая же — спрашиваем.
+  # Хеш для отладки (помогает понять — реально ли разные версии)
+  if command -v sha256sum &>/dev/null; then
+    local cur_hash new_hash
+    cur_hash=$(sha256sum "$target" 2>/dev/null | cut -c1-12)
+    new_hash=$(sha256sum "$tmp_file" 2>/dev/null | cut -c1-12)
+    echo -e "  ${D}Хеши:    $cur_hash → $new_hash${N}"
+    if [[ "$cur_hash" == "$new_hash" ]]; then
+      info "Файлы идентичны (тот же hash) — обновление не требуется"
+      rm -f "$tmp_file"
+      return 0
+    fi
+    echo ""
+  fi
+
+  # ───── 5. Сравнение версий ─────
   local cur_num new_num
   cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
   new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
@@ -1168,7 +1228,7 @@ do_self_update() {
   if [[ "$new_ver" == "?" ]]; then
     warn "Не удалось определить версию"
     local CONFIRM_FORCE
-    read -rp "$(echo -e "${C}  Установить всё равно? [y/N]: ${N}")" CONFIRM_FORCE
+    safe_read CONFIRM_FORCE "$(echo -e "${C}  Установить всё равно? [y/N]: ${N}")"
     if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
       rm -f "$tmp_file"
       return 0
@@ -1179,16 +1239,16 @@ do_self_update() {
     echo -e "${Y}  Возможно ты обновлял скрипт вручную, а в репо ещё старая версия.${N}"
     echo ""
     local CONFIRM_DOWNGRADE
-    read -rp "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")" CONFIRM_DOWNGRADE
+    safe_read CONFIRM_DOWNGRADE "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")"
     if [[ ! "$CONFIRM_DOWNGRADE" =~ ^[Yy]$ ]]; then
       info "Отменено — текущая версия сохранена"
       rm -f "$tmp_file"
       return 0
     fi
   elif [[ "$new_num" -eq "$cur_num" ]]; then
-    info "Версия совпадает, обновление не нужно"
+    info "Версия совпадает, но содержимое отличается (обновление через git без bump VERSION?)"
     local CONFIRM_FORCE
-    read -rp "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")" CONFIRM_FORCE
+    safe_read CONFIRM_FORCE "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")"
     if [[ ! "$CONFIRM_FORCE" =~ ^[Yy]$ ]]; then
       rm -f "$tmp_file"
       return 0
@@ -1197,7 +1257,7 @@ do_self_update() {
     ok "Доступно обновление: $VERSION → $new_ver"
   fi
 
-  # Бэкап текущего скрипта
+  # ───── 6. Бэкап текущего скрипта ─────
   local backup="${target}.bak.$(date +%s)"
   if cp "$target" "$backup" 2>/dev/null; then
     info "Резервная копия: $backup"
@@ -1205,13 +1265,12 @@ do_self_update() {
     warn "Не удалось создать резервную копию (продолжаем)"
   fi
 
-  # Atomic replace
+  # ───── 7. Atomic replace ─────
   chmod +x "$tmp_file"
   if mv "$tmp_file" "$target"; then
     ok "Скрипт обновлён до $new_ver"
 
     # Авто-очистка PPA остатков при апгрейде с версий до v6.7 (когда был PPA)
-    # Сравним мажорные/минорные числа: если новая >= 6.7, чистим
     local new_major_minor
     new_major_minor=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
     if [[ "${new_major_minor:-0}" -ge "6007" ]]; then
@@ -1232,10 +1291,19 @@ do_self_update() {
       fi
     fi
 
+    # ───── 8. Сброс bash hash cache ─────
+    # Bash кеширует пути исполняемых файлов в памяти. После mv нужен сброс,
+    # иначе при следующем запуске awg2 может выполниться старый кеш.
+    hash -r 2>/dev/null || true
+
     echo ""
-    info "Перезапусти: ${W}sudo awg2${N}"
+    echo -e "  ${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  ${W}  ВАЖНО: текущий процесс продолжает работать в старой версии${N}"
+    echo -e "  ${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo ""
-    exit 0
+    echo -e "  Выйди из меню (${W}0${N}) и запусти снова: ${W}sudo awg2${N}"
+    echo ""
+    return 0
   else
     err "Не удалось заменить файл (нет прав?)"
     info "Скачанная версия: $tmp_file"
@@ -1348,7 +1416,7 @@ show_menu() {
   echo -e "  ${C}▸ Шифрованный DNS:${N}"
   if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
      iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
-    echo -e "  ${C}16)${N} DNS-шифрование  ${G}● включено${N} ${D}(DoH через Cloudflare/Google/Quad9)${N}"
+    echo -e "  ${C}16)${N} DNS-шифрование  ${G}● включено${N} ${D}(DoH через Cloudflare/Google/Cisco)${N}"
   elif command -v dnscrypt-proxy &>/dev/null; then
     echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
   else
@@ -1371,7 +1439,7 @@ choose_dns() {
      iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
     echo -e "  ${G}⚡ Шифрованный DNS включён${N} ${D}(пункт 16 главного меню)${N}"
     echo -e "  ${D}→ Любой выбор будет автоматически перенаправлен через DoH${N}"
-    echo -e "  ${D}→ Реальные запросы пойдут через Cloudflare/Google/Quad9${N}"
+    echo -e "  ${D}→ Реальные запросы пойдут через Cloudflare/Google/Cisco${N}"
     echo ""
   fi
 
@@ -1939,7 +2007,7 @@ do_gen() {
   echo -e "  ${W}MTU        : ${N}$MTU"
   echo -e "  ${W}Порт       : ${N}$PORT"
   echo ""
-  read -rp "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")" CONFIRM
+  safe_read CONFIRM "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")"
   CONFIRM=${CONFIRM:-y}
   [[ $CONFIRM =~ ^[Yy]$ ]] || { warn "Отменено."; return 0; }
 
@@ -2057,7 +2125,7 @@ do_gen() {
     echo -e "  ${Y}  • Порт $PORT заблокирован → ufw allow $PORT/udp${N}"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
-      read -rp "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" RESTORE_BAK || true
+      safe_read RESTORE_BAK "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" || true
       if [[ "$RESTORE_BAK" =~ ^[Yy]$ ]]; then
         cp "$bak_ts" "$SERVER_CONF"
         awg-quick up "$SERVER_CONF" 2>/dev/null || true
@@ -2068,7 +2136,7 @@ do_gen() {
   fi
 
   if command -v ufw &>/dev/null; then
-    read -rp "$(echo -e "${C}  Открыть порт $PORT/udp в UFW? [Y/n]: ${N}")" OPEN_UFW
+    safe_read OPEN_UFW "$(echo -e "${C}  Открыть порт $PORT/udp в UFW? [Y/n]: ${N}")"
     OPEN_UFW=${OPEN_UFW:-y}
     if [[ $OPEN_UFW =~ ^[Yy]$ ]]; then
       ufw allow "${PORT}/udp" comment "AmneziaWG" || true
@@ -2359,7 +2427,7 @@ do_delete_client() {
   echo -e "     Ключ: ${D}${del_pk:0:20}...${N}"
   echo ""
   local CONFIRM
-  read -rp "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")" CONFIRM
+  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")"
   [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
 
   # Бекап
@@ -2453,7 +2521,7 @@ do_add_client() {
   local client_file="/root/${client_name}_awg2.conf"
   if [[ -f "$client_file" ]]; then warn "Файл $client_file уже существует — будет перезаписан"; fi
 
-  read -rp "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")" CONFIRM_IP
+  safe_read CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")"
   CONFIRM_IP=${CONFIRM_IP:-y}
   if [[ ! $CONFIRM_IP =~ ^[Yy]$ ]]; then
     read -rp "  IP вручную (пример: ${base_ip}.5/32): " client_addr
@@ -2790,7 +2858,7 @@ do_restart() {
     echo -e "  ${Y}→ Затем пункт 2 для создания сервера${N}"
     echo ""
     local CONFIRM_INSTALL
-    read -rp "$(echo -e "${G}  Установить сейчас? [y/N]: ${N}")" CONFIRM_INSTALL
+    safe_read CONFIRM_INSTALL "$(echo -e "${G}  Установить сейчас? [y/N]: ${N}")"
     case "$CONFIRM_INSTALL" in
       [yY]|[yY][eE][sS])
         do_install
@@ -2842,7 +2910,7 @@ do_reset_server() {
   echo ""
 
   local CONFIRM_RST
-  read -rp "$(echo -e "${R}  Подтверди сброс [yes/N]: ${N}")" CONFIRM_RST
+  safe_read CONFIRM_RST "$(echo -e "${R}  Подтверди сброс [yes/N]: ${N}")"
   if [[ "$CONFIRM_RST" != "yes" ]]; then
     warn "Отменено."
     return 0
@@ -3180,7 +3248,7 @@ _warp_register() {
     info "     export HTTPS_PROXY=http://proxy.example.com:8080"
     info "  3. Использовать готовый wgcf-account.toml с другого сервера"
     echo ""
-    read -rp "$(echo -e "${C}  Продолжить попытку регистрации? [y/N]: ${N}")" CONT
+    safe_read CONT "$(echo -e "${C}  Продолжить попытку регистрации? [y/N]: ${N}")"
     [[ ! "$CONT" =~ ^[Yy]$ ]] && { warn "Отменено"; return 1; }
   fi
 
@@ -4015,7 +4083,7 @@ _warp_remove() {
   warn "  • /usr/local/bin/wgcf"
   warn "  • Health-check service/timer"
   echo ""
-  read -rp "$(echo -e "${R}  Подтверди [yes/N]: ${N}")" CONFIRM
+  safe_read CONFIRM "$(echo -e "${R}  Подтверди [yes/N]: ${N}")"
   [[ "$CONFIRM" != "yes" ]] && { warn "Отменено"; return 0; }
 
   _warp_down
@@ -4344,19 +4412,22 @@ _dns_proxy_install() {
   fi
 
   # 2. Проверка конфликтующих DNS-сервисов на 53 порту
-  # systemd-resolved слушает на 127.0.0.53 — это OK
-  # А вот pi-hole / unbound / bind / powerdns на 0.0.0.0:53 — конфликт
+  # Игнорируем systemd-resolved subsystems (127.0.0.53, 127.0.0.54) — они не мешают
+  # И наш собственный 127.0.2.1 (dnscrypt-proxy)
+  # Реальные конфликты: pi-hole, unbound, bind, powerdns на 0.0.0.0:53 или public IP
   local conflicting_dns=""
-  if ss -tulpn 2>/dev/null | grep -E ':(53|853)\s' | grep -v "127.0.0.53\|127.0.2.1" | head -3 | grep -q .; then
-    conflicting_dns=$(ss -tulpn 2>/dev/null | grep -E ':(53|853)\s' | grep -v "127.0.0.53\|127.0.2.1" | head -3)
-    warn "На сервере уже работают DNS-сервисы:"
-    echo "$conflicting_dns" | while read line; do echo "    $line"; done
+  conflicting_dns=$(ss -tulpn 2>/dev/null | grep -E ':(53|853)\s' | \
+    grep -vE "127\.0\.0\.5[34]|127\.0\.2\.1|127\.0\.0\.1" | head -3)
+
+  if [[ -n "$conflicting_dns" ]]; then
+    warn "На сервере уже работают DNS-сервисы (могут конфликтовать):"
+    echo "$conflicting_dns" | while read -r line; do echo "    $line"; done
     echo ""
-    warn "Это может вызвать конфликты. Возможные причины:"
+    warn "Возможные причины:"
     info "  • Pi-hole / Unbound / BIND / PowerDNS"
     info "  • Другая инсталляция dnscrypt-proxy"
     echo ""
-    read -rp "$(echo -e "  ${Y}Продолжить установку всё равно? [y/N]: ${N}")" CONT_INSTALL
+    safe_read CONT_INSTALL "$(echo -e "  ${Y}Продолжить установку всё равно? [y/N]: ${N}")"
     if [[ ! "${CONT_INSTALL,,}" =~ ^y ]]; then
       warn "Отменено"
       return 1
@@ -4410,7 +4481,7 @@ require_nolog = true
 require_nofilter = true
 
 # Резолверы (DoH only — стабильнее DNSCrypt)
-server_names = ['cloudflare', 'google', 'quad9-doh-ip4-port443']
+server_names = ['cloudflare', 'google', 'cisco-doh']
 
 dnscrypt_servers = false
 doh_servers = true
@@ -4750,7 +4821,7 @@ _dns_proxy_remove() {
   echo -e "  ${R}•${N} Persistence (systemd unit) и Healthcheck (timer)"
   echo -e "  ${R}•${N} Сервис dnscrypt-proxy будет ${Y}остановлен${N}"
   echo ""
-  read -rp "$(echo -e "  Также ${R}полностью удалить пакет${N} dnscrypt-proxy? [y/N]: ")" REMOVE_PKG
+  safe_read REMOVE_PKG "$(echo -e "  Также ${R}полностью удалить пакет${N} dnscrypt-proxy? [y/N]: ")"
 
   # 1. Healthcheck timer
   systemctl disable --now awg-dns-healthcheck.timer 2>/dev/null || true
@@ -4861,11 +4932,11 @@ _dns_proxy_change_upstream() {
   echo ""
   hdr "↻  Сменить upstream резолверы"
   echo ""
-  echo -e "  ${G}1)${N} Cloudflare + Google + Quad9 ${D}(по умолчанию, рекомендуется)${N}"
+  echo -e "  ${G}1)${N} Cloudflare + Google + Cisco ${D}(по умолчанию, рекомендуется)${N}"
   echo -e "  ${G}2)${N} Только Cloudflare ${D}(быстрее, один источник)${N}"
-  echo -e "  ${G}3)${N} Cloudflare + Quad9 ${D}(без Google — privacy-focused)${N}"
-  echo -e "  ${G}4)${N} Только Quad9 ${D}(швейцарский, no-logging)${N}"
-  echo -e "  ${G}5)${N} Только Google ${D}(если CF/Q9 заблокированы)${N}"
+  echo -e "  ${G}3)${N} Yandex Safe ${D}(российский, без РКН блокировок)${N}"
+  echo -e "  ${G}4)${N} Только Cisco ${D}(OpenDNS, надёжный)${N}"
+  echo -e "  ${G}5)${N} Только Google ${D}(если другие заблокированы)${N}"
   echo -e "  ${C}6) Ввести вручную${N} ${D}(произвольный список из public-resolvers.md)${N}"
   echo -e "  ${G}0)${N} Отмена"
   echo ""
@@ -4873,10 +4944,10 @@ _dns_proxy_change_upstream() {
 
   local servers=""
   case "${UPSTREAM_CHOICE:-}" in
-    1) servers="['cloudflare', 'google', 'quad9-doh-ip4-port443']" ;;
+    1) servers="['cloudflare', 'google', 'cisco-doh']" ;;
     2) servers="['cloudflare']" ;;
-    3) servers="['cloudflare', 'quad9-doh-ip4-port443']" ;;
-    4) servers="['quad9-doh-ip4-port443']" ;;
+    3) servers="['yandex-safe']" ;;
+    4) servers="['cisco-doh']" ;;
     5) servers="['google']" ;;
     6)
       echo ""
@@ -4888,18 +4959,16 @@ _dns_proxy_change_upstream() {
       echo -e "  ${C}cloudflare-security${N}          — Cloudflare с фильтром malware"
       echo -e "  ${C}cloudflare-family${N}            — Cloudflare с фильтром adult"
       echo -e "  ${C}google${N}                       — 8.8.8.8 / 8.8.4.4"
-      echo -e "  ${C}quad9-doh-ip4-port443${N}        — Quad9 (no-filter)"
-      echo -e "  ${C}quad9-doh-ip4-port443-filter-pri${N} — Quad9 (security filter)"
+      echo -e "  ${C}cisco-doh${N}                    — Cisco OpenDNS"
       echo -e "  ${C}adguard-dns-doh${N}              — AdGuard (фильтр рекламы)"
-      echo -e "  ${C}nextdns-XXXXXX${N}               — NextDNS (нужна регистрация)"
-      echo -e "  ${C}mullvad-doh${N}                  — Mullvad (no-logging)"
+      echo -e "  ${C}yandex-safe${N}                  — Yandex Safe"
       echo -e "  ${C}controld-uncensored${N}          — Control D"
       echo ""
       echo -e "  ${Y}⚠ Внимание:${N} если выбрать ${R}filter${N}-резолвер,"
       echo -e "  отключи ${C}require_nofilter${N} в конфиге, иначе сервер не запустится."
       echo ""
       echo -e "  ${W}Введи через запятую:${N} ${D}cloudflare,google${N}"
-      echo -e "  ${W}Или один:${N} ${D}quad9-doh-ip4-port443${N}"
+      echo -e "  ${W}Или один:${N} ${D}cisco-doh${N}"
       echo ""
       read -rp "  Резолверы: " MANUAL_INPUT
 
@@ -4971,13 +5040,13 @@ do_dns_menu() {
     _dns_proxy_status || true
     echo ""
     echo -e "  ${D}При включении: все DNS-запросы клиентов идут через DoH${N}"
-    echo -e "  ${D}к Cloudflare / Google / Quad9 (DNSSEC + no-logging)${N}"
+    echo -e "  ${D}к Cloudflare / Google / Cisco (DNSSEC + no-logging)${N}"
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo -e "  1) Включить (установить + настроить)"
     echo -e "  2) Перезапустить сервис"
     echo -e "  3) Логи (последние 50 строк)"
-    echo -e "  4) Сменить upstream (Cloudflare / Google / Quad9)"
+    echo -e "  4) Сменить upstream (Cloudflare / Google / Cisco)"
     echo -e "  ${R}5) Выключить и удалить${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
@@ -5020,7 +5089,7 @@ do_uninstall() {
   echo -e "  ${R}—${N} Автозапуск awg-quick@awg0"
   echo ""
   local CONFIRM_DEL
-  read -rp "$(echo -e "${R}  Подтверди удаление [yes/N]: ${N}")" CONFIRM_DEL
+  safe_read CONFIRM_DEL "$(echo -e "${R}  Подтверди удаление [yes/N]: ${N}")"
   [[ "$CONFIRM_DEL" != "yes" ]] && { warn "Отменено."; return 0; }
 
   # v6.4: авто-бэкап перед удалением (последний шанс восстановиться)
@@ -5228,7 +5297,7 @@ do_clean_clients() {
   echo -e "${Y}  ! Будет удалено ${client_count} клиентов${N}"
   echo -e "${Y}    Все конфиги клиентов из /root также будут удалены${N}"
   echo ""
-  read -rp "$(echo -e "${R}  Подтвердить удаление клиентов? [yes/N]: ${N}")" CONFIRM
+  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление клиентов? [yes/N]: ${N}")"
   [[ "$CONFIRM" != "yes" ]] && { warn "Отменено."; return 0; }
 
   # v6.4: авто-бэкап перед опасной операцией
@@ -5383,7 +5452,7 @@ do_restore() {
   local chosen_backup="${backups[$((RESTORE_CHOICE - 1))]}"
   echo -e "${C}  → Восстановление из: ${W}$(basename "$chosen_backup")${N}"
 
-  read -rp "$(echo -e "${R}  Текущий серверный конфиг будет заменён. Продолжить? [yes/N]: ${N}")" CONFIRM_RESTORE
+  safe_read CONFIRM_RESTORE "$(echo -e "${R}  Текущий серверный конфиг будет заменён. Продолжить? [yes/N]: ${N}")"
   [[ "$CONFIRM_RESTORE" != "yes" ]] && { warn "Отменено."; return 0; }
 
   # Останавливаем интерфейс
