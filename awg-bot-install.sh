@@ -286,6 +286,14 @@ else
 fi
 else
   info "Использую сохранённый токен"
+  # При обновлении токен уже валиден, но username нужен для финального сообщения.
+  # Делаем лёгкий getMe — при сетевой ошибке оставляем плейсхолдер.
+  API_RESP=$(curl -sf "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null || echo "")
+  if echo "$API_RESP" | grep -q '"ok":true'; then
+    BOT_USERNAME=$(echo "$API_RESP" | grep -oP '"username":"\K[^"]+')
+  else
+    BOT_USERNAME=""
+  fi
 fi
 
 # ── Шаг 4: Инструкция — получение chat_id ────────────────────────────────────
@@ -695,6 +703,20 @@ def fmt_bytes(b: int) -> str:
     return f"{b / 1024 ** 3:.1f}GB"
 
 
+def plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Склонение русских существительных по числу.
+    Пример: plural_ru(5, 'клиент', 'клиента', 'клиентов') → 'клиентов'
+    """
+    n = abs(int(n))
+    mod10 = n % 10
+    mod100 = n % 100
+    if mod10 == 1 and mod100 != 11:
+        return one
+    if 2 <= mod10 <= 4 and not (12 <= mod100 <= 14):
+        return few
+    return many
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Клавиатуры — отдельный класс (как tu.InlineKeyboard в Go)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -705,8 +727,8 @@ class Keyboards:
         """Постоянная клавиатура снизу — главное меню."""
         return ReplyKeyboardMarkup([
             ["👥 Клиенты",          "📊 Статус"],
-            ["➕ Добавить клиента"],
-            ["🔄 Перезапустить awg0"],
+            ["➕ Добавить клиента", "🌐 DNS статус"],
+            ["🔄 Restart awg0", "🌐 Restart DNS"],
         ], resize_keyboard=True)
 
     @staticmethod
@@ -718,13 +740,15 @@ class Keyboards:
 
     @staticmethod
     def clients(clients: list, stats: dict) -> InlineKeyboardMarkup:
-        rows = []
+        # Группируем кнопки по 2 в ряд — компактнее при 5+ клиентах
+        buttons = []
         for c in clients:
             icon = online_icon(stats.get(c["pubkey"], {}).get("last_hs", 0))
-            rows.append([InlineKeyboardButton(
+            buttons.append(InlineKeyboardButton(
                 f"{icon} {c['name']}  {c['ip'].split('/')[0]}",
                 callback_data=f"c:{c['name']}"
-            )])
+            ))
+        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
@@ -817,7 +841,7 @@ def text_status() -> str:
         f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
         f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
-        f"👥 {len(clients)} клиентов  🟢 {online} онлайн\n"
+        f"👥 {len(clients)} {plural_ru(len(clients), 'клиент', 'клиента', 'клиентов')}  🟢 {online} онлайн\n"
         f"↓ {fmt_bytes(rx)}  ↑ {fmt_bytes(tx)}"
     )
 
@@ -901,7 +925,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• 👥 <b>Клиенты</b> — список пиров с QR/файлами\n"
         "• 📊 <b>Статус</b> — трафик и онлайн\n"
         "• ➕ <b>Добавить клиента</b> — новый пир\n"
-        "• 🔄 <b>Перезапустить awg0</b>"
+        "• 🔄 <b>Restart awg0</b> — рестарт VPN-туннеля\n"
+        "• 🌐 <b>Restart DNS</b> — рестарт dnscrypt-proxy\n"
+        "• 🌐 <b>DNS статус</b> — резолверы, DNAT, persistence"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -1475,7 +1501,7 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 <b>Статус</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"🖥 <code>{info['ip']}:{info['port']}</code>\n"
             f"📡 {'🟢 активен' if info['iface_up'] else '🔴 остановлен'}\n"
-            f"👥 {len(clients)} клиентов  🟢 {online} онлайн\n"
+            f"👥 {len(clients)} {plural_ru(len(clients), 'клиент', 'клиента', 'клиентов')}  🟢 {online} онлайн\n"
             f"↓ {fmt_bytes(rx)}  ↑ {fmt_bytes(tx)}"
         )
         await update.message.reply_text(
@@ -1485,7 +1511,7 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]])
         )
 
-    elif text == "🔄 Перезапустить awg0":
+    elif text == "🔄 Restart awg0":
         msg = await update.message.reply_text("⏳ Перезапускаю awg0...")
         await asyncio.to_thread(run, ["awg-quick", "down", SERVER_CONF])
         await asyncio.sleep(1)
@@ -1495,6 +1521,97 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = "✅ awg0 перезапущен" if rc == 0 else f"❌ Ошибка:\n<code>{_html.escape(err[:200])}</code>"
         await msg.edit_text(result, parse_mode=ParseMode.HTML)
 
+    elif text == "🌐 Restart DNS":
+        msg = await update.message.reply_text("⏳ Перезагружаю dnscrypt-proxy...")
+        # Проверяем что сервис существует (dnscrypt-proxy опционален — пункт 16 awg2)
+        rc_check, _, _ = await asyncio.to_thread(
+            run, ["systemctl", "is-active", "--quiet", "dnscrypt-proxy"]
+        )
+        if rc_check != 0:
+            await msg.edit_text(
+                "⚠️ dnscrypt-proxy не запущен или не установлен.\n"
+                "Включи его в <code>awg2</code> → пункт 16.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        # Перезапуск
+        rc, _, err = await asyncio.to_thread(
+            run, ["systemctl", "restart", "dnscrypt-proxy"]
+        )
+        await asyncio.sleep(2)
+        # Контроль что поднялся
+        rc_after, _, _ = await asyncio.to_thread(
+            run, ["systemctl", "is-active", "--quiet", "dnscrypt-proxy"]
+        )
+        if rc == 0 and rc_after == 0:
+            await msg.edit_text("✅ DNS перезагружен")
+        else:
+            err_text = err[:200] if err else "сервис не поднялся после перезапуска"
+            await msg.edit_text(
+                f"❌ Ошибка:\n<code>{_html.escape(err_text)}</code>",
+                parse_mode=ParseMode.HTML
+            )
+
+    elif text == "🌐 DNS статус":
+        msg = await update.message.reply_text("⏳ Собираю статус DNS...")
+        # 1. Установлен ли вообще
+        rc_inst, _, _ = await asyncio.to_thread(
+            run, ["which", "dnscrypt-proxy"]
+        )
+        if rc_inst != 0:
+            await msg.edit_text(
+                "🌐 <b>DNS статус</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "○ <b>не установлен</b>\n\n"
+                "Активные DNS — из awg0 (DNS=… в конфиге, обычно 1.1.1.1).\n"
+                "Чтобы включить шифрованный DNS — <code>awg2</code> → пункт 16.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        # 2. Активен ли
+        rc_act, _, _ = await asyncio.to_thread(
+            run, ["systemctl", "is-active", "--quiet", "dnscrypt-proxy"]
+        )
+        active = rc_act == 0
+        # 3. Резолверы из конфига
+        servers = "—"
+        try:
+            with open("/etc/dnscrypt-proxy/dnscrypt-proxy.toml") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("server_names"):
+                        # server_names = ['cloudflare', 'quad9-dnscrypt-ip4-nofilter-pri']
+                        val = s.split("=", 1)[1].strip()
+                        val = val.strip("[]").replace("'", "").replace('"', "")
+                        servers = val.strip()
+                        break
+        except (OSError, IndexError):
+            pass
+        # 4. DNAT правило (iptables)
+        rc_dnat, _, _ = await asyncio.to_thread(run, [
+            "iptables", "-t", "nat", "-C", "PREROUTING",
+            "-i", "awg0", "-p", "udp", "--dport", "53",
+            "-j", "DNAT", "--to-destination", "127.0.2.1:53"
+        ])
+        dnat_ok = rc_dnat == 0
+        # 5. Persistence (переживёт reboot)
+        rc_persist, _, _ = await asyncio.to_thread(
+            run, ["systemctl", "is-enabled", "--quiet", "awg-dns-persist.service"]
+        )
+        persist_ok = rc_persist == 0
+        # 6. Healthcheck timer
+        rc_hc, _, _ = await asyncio.to_thread(
+            run, ["systemctl", "is-active", "--quiet", "awg-dns-healthcheck.timer"]
+        )
+        hc_ok = rc_hc == 0
+        # Сборка ответа
+        out = "🌐 <b>DNS статус</b>\n━━━━━━━━━━━━━━━━━━\n"
+        out += f"Сервис      : {'🟢 активен' if active else '🔴 выключен'}\n"
+        out += f"Резолверы   : <code>{_html.escape(servers)}</code>\n"
+        out += f"DNAT awg0   : {'✅' if dnat_ok else '❌ нет правила'}\n"
+        out += f"Persistence : {'✅ переживёт reboot' if persist_ok else '⚠️ исчезнет после reboot'}\n"
+        out += f"Healthcheck : {'✅ каждые 2 мин' if hc_ok else '○ выключен'}"
+        await msg.edit_text(out, parse_mode=ParseMode.HTML)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Добавление клиента (бизнес-логика)
@@ -1502,40 +1619,208 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _CPS_CODE = r"""
 import sys, secrets, struct, random
-def rh(n): return secrets.token_bytes(n)
-def ri(a,b): return random.randint(a,b)
-def rc(lst): return random.choice(lst)
-def u16(v): return struct.pack(">H",v&0xFFFF)
-def cps(r): return "<b 0x%s>" % r.hex()
-P=sys.argv[1] if len(sys.argv)>1 else "quic"
-def quic_i():
-    fb=rc([0xC0,0xC0,0xC0,0xC3]); pn=(fb&3)+1
-    enc=1200-26-pn; pv=u16(0x4000|pn+enc)
-    return bytes([fb])+b"\x00\x00\x00\x01"+bytes([8])+rh(8)+bytes([8])+rh(8)+b"\x00"+pv+rh(pn)+rh(enc)
-def quic_s():
-    pn=ri(1,2); fb=0x40|(ri(0,1)<<5)|(ri(0,1)<<2)|(pn-1)
-    return bytes([fb])+rh(8)+rh(pn)+rh(ri(40,90))
-def sip():
-    h=rc(["sipgate.de","sip.ovh.net","sip.beeline.ru","sip.mts.ru"])
-    u=rc(["alice","bob","100","200"])+str(ri(10,99))
-    ip="10.%d.%d.%d"%(ri(0,255),ri(0,255),ri(10,200))
-    br="z9hG4bK"+secrets.token_hex(7); tag=secrets.token_hex(4)
-    cid="%s@%s"%(secrets.token_hex(8),h)
-    return("\r\n".join(["REGISTER sip:%s SIP/2.0"%h,
-        "Via: SIP/2.0/UDP %s:5060;branch=%s;rport"%(ip,br),
-        "Max-Forwards: 70","From: <sip:%s@%s>;tag=%s"%(u,h,tag),
-        "To: <sip:%s@%s>"%(u,h),"Call-ID: %s"%cid,
-        "CSeq: %d REGISTER"%ri(1,50),
-        "Contact: <sip:%s@%s:5060>"%(u,ip),
-        "Expires: %d"%rc([300,600,3600]),"Content-Length: 0","",""])).encode()
-def dns(d="google.com"):
-    qn=b"".join(bytes([len(l)])+l.encode() for l in d.split("."))+b"\x00"
-    return b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"+qn+b"\x00\x01\x00\x01"
-pool=["google.com","github.com","yandex.ru","vk.com","cloudflare.com"]
-random.shuffle(pool)
-if P=="sip": print(cps(sip())); [print("") for _ in range(4)]
-elif P=="dns": [print("<r 2><b 0x%s>"%dns(pool[i%len(pool)]).hex()) for i in range(5)]
-else: print(cps(quic_i())); [print(cps(quic_s())) for _ in range(4)]
+
+# ── Утилиты ────────────────────────────────────────────
+def rh(n):  return secrets.token_bytes(n)
+# Криптостойкий int [a..b] — заменяет random.randint для всех параметров
+# где предсказуемость нежелательна (pn_len, ports, expires и т.д.)
+def ri(a, b):
+    if a > b: a, b = b, a
+    span = b - a + 1
+    return a + secrets.randbelow(span)
+def rc(lst): return lst[secrets.randbelow(len(lst))]
+def u16(v): return struct.pack(">H", v & 0xFFFF)
+def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
+def u24(v): return struct.pack(">I", v)[1:]
+def qv(v):
+    if v < 64:    return bytes([v])
+    elif v < 16384: return bytes([0x40|(v>>8)&0x3f, v&0xff])
+    else:         return bytes([0x80|(v>>24)&0x3f,(v>>16)&0xff,(v>>8)&0xff,v&0xff])
+def to_cps(raw): return "<b 0x%s>" % raw.hex()
+
+# Криптостойкий shuffle (Fisher-Yates) — заменяет random.shuffle
+def secure_shuffle(lst):
+    for i in range(len(lst) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        lst[i], lst[j] = lst[j], lst[i]
+    return lst
+
+# Случайный приватный IP — три варианта подсетей (10/8, 172.16/12, 192.168/16)
+def rand_private_ip():
+    kind = secrets.randbelow(3)
+    if kind == 0:
+        return "10.%d.%d.%d" % (ri(1, 254), ri(0, 255), ri(2, 254))
+    elif kind == 1:
+        return "172.%d.%d.%d" % (ri(16, 31), ri(0, 255), ri(2, 254))
+    else:
+        return "192.168.%d.%d" % (ri(0, 255), ri(2, 254))
+
+# ── Аргументы ──────────────────────────────────────────
+# argv[1] = profile: quic|sip|dns
+# argv[2] = domain (опционально, иначе из пула)
+ALLOWED_PROFILES = ("quic", "sip", "dns")
+PROFILE = sys.argv[1] if len(sys.argv) > 1 else "quic"
+DOMAIN  = sys.argv[2] if len(sys.argv) > 2 else ""
+
+# Валидация PROFILE — защита от опечатки в вызывающем коде.
+# При неизвестном профиле фоллбэк на "quic" + warn в stderr (не прерываем,
+# чтобы не сломать пайплайн, но даём диагностику).
+if PROFILE not in ALLOWED_PROFILES:
+    sys.stderr.write("[CPS] WARN: unknown profile \"%s\", fallback=quic\n" % PROFILE)
+    PROFILE = "quic"
+
+DOMAIN_POOL = [
+    "google.com","github.com","gitlab.com","stackoverflow.com",
+    "microsoft.com","apple.com","amazon.com","wikipedia.org",
+    "mozilla.org","cdn.jsdelivr.net","unpkg.com","pypi.org",
+    "ubuntu.com","debian.org","hetzner.com","ovhcloud.com",
+    "digitalocean.com",
+]
+if not DOMAIN:
+    DOMAIN = rc(DOMAIN_POOL)
+
+SIP_POOL = [
+    "sipgate.de","sip.ovh.net","sip.voipfone.co.uk","sip.linphone.org",
+    "sip.zadarma.com","sip.dus.net","sip.easybell.de","sip.1und1.de",
+    "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
+]
+
+# ── I1: QUIC Long Header Initial, строго 1200 байт ─────
+# Chrome fingerprint: fb=0xC0/0xC3, DCID=8B, SCID=8B, token=0, pad до 1200
+def gen_quic_initial(domain=None):
+    TARGET = 1200
+    fb     = rc([0xC0, 0xC0, 0xC0, 0xC3])   # Chrome чаще шлёт 0xC0
+    pn_len = (fb & 0x03) + 1
+    dcid   = rh(8)
+    scid   = rh(8)
+    # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
+    enc_size  = TARGET - 26 - pn_len
+    # Защита от отрицательного размера (на текущих параметрах невозможно,
+    # но защищаемся от будущих правок констант)
+    if enc_size < 1:
+        enc_size = 1
+    plen_val  = pn_len + enc_size
+    pl_varint = u16(0x4000 | plen_val)
+    pn      = rh(pn_len)
+    # Payload: полностью случайный (имитация зашифрованного ClientHello)
+    # Chrome Initial не содержит блоков нулей — всё выглядит как шифротекст
+    payload = rh(enc_size)
+    pkt = (bytes([fb]) + b"\x00\x00\x00\x01" +
+           bytes([8]) + dcid + bytes([8]) + scid +
+           b"\x00" + pl_varint + pn + payload)
+    # Защита размера — без assert (assert удаляется при python3 -O)
+    if len(pkt) != TARGET:
+        # Достраиваем или обрезаем до TARGET
+        if len(pkt) < TARGET:
+            pkt += rh(TARGET - len(pkt))
+        else:
+            pkt = pkt[:TARGET]
+    return pkt
+
+# ── I2-I5: QUIC Short Header (1-RTT) ───────────────────
+# Chrome после Initial шлёт 1-RTT пакеты: Short Header 0x40-0x7F.
+# ВАЖНО: в реальном QUIC v1 биты spin/key_phase/pn_len МАСКИРУЮТСЯ
+# header protection (RFC 9001 §5.4) — DPI видит их как случайные.
+# Здесь они и так случайные, поэтому корректно имитируется HP-masked байт.
+# pn_len теперь 1-4 (Chrome чаще шлёт 2-4) для большей реалистичности.
+def gen_quic_short():
+    pn_len = ri(1, 4)
+    # Биты второго уровня — после HP они выглядят случайно для DPI
+    spin   = ri(0, 1) << 5
+    key    = ri(0, 1) << 2
+    fb     = 0x40 | spin | key | (pn_len - 1)
+    dcid   = rh(8)
+    pn     = rh(pn_len)
+    data   = rh(ri(40, 90))
+    return bytes([fb]) + dcid + pn + data
+
+# ── SIP REGISTER ────────────────────────────────────────
+# Полный реалистичный набор заголовков как у Linphone / Zoiper / MicroSIP.
+# Минималистичный REGISTER без User-Agent/Allow/Supported характерен
+# для сканеров и легко детектится SIP-aware DPI.
+SIP_UA_POOL = [
+    "Linphone/5.2.5 (belle-sip/5.2.0)",
+    "Zoiper rv2.10.20.4",
+    "MicroSIP/3.21.4",
+    "Bria 6.5.1",
+    "PortSIP UA 16.4",
+]
+def gen_sip():
+    host   = rc(SIP_POOL)
+    user   = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
+    lip    = rand_private_ip()
+    lport  = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
+    branch = "z9hG4bK" + secrets.token_hex(7)
+    tag    = secrets.token_hex(4)
+    callid = "%s@%s" % (secrets.token_hex(8), host)
+    cseq   = ri(1, 50)
+    # transport чаще UDP (исторически), реже TCP/TLS
+    transport = rc(["udp","udp","udp","udp","tcp"])
+    user_agent = rc(SIP_UA_POOL)
+    lines  = [
+        "REGISTER sip:%s SIP/2.0" % host,
+        "Via: SIP/2.0/%s %s:%d;branch=%s;rport" % (transport.upper(), lip, lport, branch),
+        "Max-Forwards: 70",
+        "From: <sip:%s@%s>;tag=%s" % (user, host, tag),
+        "To: <sip:%s@%s>" % (user, host),
+        "Call-ID: %s" % callid,
+        "CSeq: %d REGISTER" % cseq,
+        "Contact: <sip:%s@%s:%d;transport=%s>" % (user, lip, lport, transport),
+        "User-Agent: %s" % user_agent,
+        "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
+        "Supported: replaces, outbound, gruu, path",
+        "Expires: %d" % rc([300,600,1800,3600]),
+        "Content-Length: 0",
+        "", ""
+    ]
+    return "\r\n".join(lines).encode()
+
+# ── DNS Query c EDNS0 ───────────────────────────────────
+# Современные клиенты (systemd-resolved, Chrome, dnsmasq) всегда шлют
+# EDNS0 OPT-RR с advertised buffer size. Без него запрос выглядит как
+# legacy-резолвер — редкий паттерн в современном трафике.
+# I1 начинается с <r 2> (TXID), остальные — тоже с TXID.
+def gen_dns(domain=None):
+    host  = domain or DOMAIN
+    flags = b"\x01\x00"   # QR=0 Query, RD=1
+    # counts: QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1 (для OPT-RR)
+    counts = b"\x00\x01\x00\x00\x00\x00\x00\x01"
+    qn    = b""
+    for lbl in host.split("."):
+        # Защита от лейблов > 63 байт (DNS RFC 1035)
+        lbl_b = lbl.encode()[:63]
+        qn += bytes([len(lbl_b)]) + lbl_b
+    qn += b"\x00"
+    qtype  = b"\x00\x01"   # A record
+    qclass = b"\x00\x01"   # IN
+    # EDNS0 OPT-RR (RFC 6891):
+    #   NAME=root(0x00), TYPE=OPT(41=0x29), CLASS=UDP_size (1232/4096),
+    #   TTL=ext_rcode(0)+version(0)+flags(0/DO=0x8000), RDLEN=0
+    udp_size = rc([1232, 4096])   # 1232 — systemd-resolved, 4096 — bind/dnsmasq
+    do_bit   = rc([0x0000, 0x8000])  # DO=0 чаще, DO=1 для DNSSEC-aware
+    opt_rr   = (b"\x00" + b"\x00\x29" + u16(udp_size) +
+                b"\x00\x00" + u16(do_bit) + b"\x00\x00")
+    return flags + counts + qn + qtype + qclass + opt_rr
+
+# ── Dispatch ─────────────────────────────────────────────
+if PROFILE == "sip":
+    print(to_cps(gen_sip()))
+    print(""); print(""); print(""); print("")
+
+elif PROFILE == "dns":
+    # DNS wire format: TXID(2b) + flags(2b) + counts(8b) + QNAME + QTYPE + QCLASS + OPT
+    # TXID рандомный через <r 2> — в начале каждого пакета
+    # Разные домены для I1-I5 чтобы не было паттерна
+    pool = DOMAIN_POOL.copy()
+    secure_shuffle(pool)
+    for i in range(5):
+        dom = pool[i % len(pool)]
+        print("<r 2><b 0x%s>" % gen_dns(dom).hex())
+
+else:  # quic (default)
+    print(to_cps(gen_quic_initial(DOMAIN)))
+    for _ in range(4):
+        print(to_cps(gen_quic_short()))
 """
 
 
@@ -1811,7 +2096,7 @@ echo ""
 hdr "√ Установка завершена"
 cat << INFO
 
-  Бот: @${BOT_USERNAME}
+  Бот: @${BOT_USERNAME:-неизвестно}
   Конфиг: $BOT_CONF
   Лог: $BOT_LOG
 
