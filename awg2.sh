@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.4"
+VERSION="v6.8.5"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -3689,9 +3689,11 @@ _warp_apply_license() {
   case "$account_type" in
     unlimited)
       ok "Warp+ Unlimited активирован"
+      echo "unlimited" > "$WARP_DIR/account_type" 2>/dev/null || true
       ;;
     limited|premium)
       ok "Warp+ активирован (тип: $account_type)"
+      echo "$account_type" > "$WARP_DIR/account_type" 2>/dev/null || true
       ;;
     free|"")
       warn "Лицензия применилась, но Warp+ не активен (тип аккаунта: ${account_type:-неизвестно})"
@@ -3699,9 +3701,11 @@ _warp_apply_license() {
       warn "  • Ключ уже использован на другом устройстве"
       warn "  • Ключ невалиден или истёк"
       warn "  • Cloudflare временно недоступен"
+      rm -f "$WARP_DIR/account_type" 2>/dev/null || true
       ;;
     *)
       ok "Warp+ активирован (тип: $account_type)"
+      echo "$account_type" > "$WARP_DIR/account_type" 2>/dev/null || true
       ;;
   esac
 
@@ -4607,9 +4611,18 @@ _warp_status() {
     [[ -z "$lic" ]] && lic=$(grep "^license_key" "$WARP_ACCOUNT" 2>/dev/null | cut -d'"' -f2 || true)
 
     if [[ -n "$lic" && ${#lic} -gt 10 ]]; then
-      # Есть лицензия — спрашиваем у Cloudflare какой тип аккаунта
-      local acc_type
-      acc_type=$(wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
+      # Сначала читаем кешированный тип (быстро, не дёргает Cloudflare API)
+      local acc_type=""
+      if [[ -f "$WARP_DIR/account_type" ]]; then
+        acc_type=$(cat "$WARP_DIR/account_type" 2>/dev/null | tr -d '[:space:]' || true)
+      fi
+      # Fallback: если кеша нет — опрашиваем Cloudflare (только тогда)
+      if [[ -z "$acc_type" ]]; then
+        acc_type=$(timeout 5 wgcf status 2>/dev/null | grep -m1 -oP 'Account type\s*:\s*\K\S+' || true)
+        # Если получили — сохраняем
+        [[ -n "$acc_type" ]] && echo "$acc_type" > "$WARP_DIR/account_type" 2>/dev/null || true
+      fi
+
       case "$acc_type" in
         unlimited)
           echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+ unlimited)${N}"
@@ -4617,8 +4630,12 @@ _warp_status() {
         limited|premium)
           echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${C}(Warp+)${N}"
           ;;
+        "")
+          # Ничего не вышло — Cloudflare недоступен или wgcf не отвечает
+          echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${D}(статус Warp+ не проверен)${N}"
+          ;;
         *)
-          # Ключ есть, но активация не подтвердилась — показываем нейтрально
+          # free или другой неактивный тип
           echo -e "  Аккаунт    : ${G}зарегистрирован${N} ${Y}(WARP, ключ не активен)${N}"
           ;;
       esac
