@@ -7257,21 +7257,30 @@ _telemt_get_route() {
 
 _telemt_remove_route() {
   local uid=$(id -u telemt 2>/dev/null || echo "")
-  [[ -z "$uid" ]] && return
-  ip rule del uidrange "$uid-$uid" table 200 2>/dev/null || true
-  ip rule del uidrange "$uid-$uid" table 201 2>/dev/null || true
+  # UID-based (Warp)
+  [[ -n "$uid" ]] && ip rule del uidrange "$uid-$uid" table 200 2>/dev/null || true
+  # Xray upstream SOCKS5 в TOML-конфиге
+  local cfg="/etc/telemt/telemt.toml"
+  if [[ -f "$cfg" ]]; then
+    sed -i '/^\[\[upstream\]\]/,/^$/d' "$cfg"
+    sed -i '/^\[\[upstream\]\]/,$ { /^\[\[upstream\]\]/d; /^type = /d; /^address = /d; /^scopes = /d; }' "$cfg" 2>/dev/null || true
+    # Проще: удаляем все строки от [[upstream]] до следующей секции или EOF
+    local tmp="${cfg}.tmp"
+    awk 'BEGIN{skip=0} /^\[\[upstream\]\]/{skip=1; next} /^\[/{if(skip){skip=0}} !skip{print}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+  fi
 }
 
 _telemt_apply_route() {
   local uid=$(id -u telemt 2>/dev/null || echo "") route="$1"
-  [[ -z "$uid" ]] && return 1
   _telemt_remove_route
+  local cfg="/etc/telemt/telemt.toml"
   case "$route" in
     warp)
       if ! ip link show warp0 &>/dev/null; then
         warn "Warp не активен. Включи Warp (пункт 15 → 3), затем примени маршрут."
         return 1
       fi
+      [[ -z "$uid" ]] && { warn "Пользователь telemt не найден"; return 1; }
       ip rule add uidrange "$uid-$uid" table 200
       ;;
     xray)
@@ -7279,7 +7288,21 @@ _telemt_apply_route() {
         warn "Xray не активен. Включи Xray (пункт 17 → 5), затем примени маршрут."
         return 1
       fi
-      ip rule add uidrange "$uid-$uid" table 201
+      if [[ -f "$cfg" ]]; then
+        # Добавляем [[upstream]] SOCKS5 в конец конфига
+        if ! grep -q '^\[\[upstream\]\]' "$cfg"; then
+          cat >> "$cfg" << 'TUPS'
+[[upstream]]
+type = "socks5"
+address = "127.0.0.1:10101"
+scopes = ["all"]
+TUPS
+        fi
+        systemctl restart telemt 2>/dev/null || true
+      else
+        warn "Конфиг Telemt не найден. Установи Telemt сначала."
+        return 1
+      fi
       ;;
   esac
   return 0
