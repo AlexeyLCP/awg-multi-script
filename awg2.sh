@@ -1780,12 +1780,6 @@ show_menu() {
   fi
 
   echo ""
-
-  # === МАРШРУТИЗАЦИЯ КЛИЕНТОВ ===
-  echo -e "  ${M}▸ Маршрутизация клиентов:${N}"
-  echo -e "  ${M}18)${N} Настроить outbound для клиентов (Direct / Warp / Xray)"
-
-  echo ""
   echo -e "  ${W}0)${N} Выход"
   echo ""
   safe_read CHOICE "$(echo -e "${C}  Выбор: ${N}")"
@@ -6753,174 +6747,6 @@ _xray_apply_peer_rules() {
   fi
 }
 
-# ── Единая маршрутизация клиентов (direct / Warp / Xray) ──────────
-
-# Возвращает текущий маршрут клиента: direct / warp / xray
-_get_client_route() {
-  local ip="$1"
-  if grep -qxF "$ip" "$WARP_PEERS" 2>/dev/null; then
-    echo "warp"
-  elif grep -qxF "$ip" "$XRAY_PEERS" 2>/dev/null; then
-    echo "xray"
-  else
-    echo "direct"
-  fi
-}
-
-# Устанавливает маршрут клиента (удаляет из всех списков, добавляет в нужный)
-_set_client_route() {
-  local ip="$1" route="$2"
-  # Удаляем из всех списков
-  [[ -f "$WARP_PEERS" ]] && sed -i "/^${ip}$/d" "$WARP_PEERS"
-  [[ -f "$XRAY_PEERS" ]] && sed -i "/^${ip}$/d" "$XRAY_PEERS"
-  case "$route" in
-    warp) mkdir -p "$WARP_DIR"; echo "$ip" >> "$WARP_PEERS" ;;
-    xray) mkdir -p "$XRAY_DIR"; echo "$ip" >> "$XRAY_PEERS" ;;
-  esac
-}
-
-do_client_routing_menu() {
-  set +e
-  while true; do
-    clear
-    echo ""
-    hdr "↗  Маршрутизация клиентов (Direct / Warp / Xray)"
-    echo ""
-
-    local warp_ok=false xray_ok=false
-    [[ -f "$WARP_CONF" ]] && warp_ok=true
-    [[ -f "$XRAY_CONF" ]] && command -v xray &>/dev/null && xray_ok=true
-
-    echo -e "  ${D}Outbounds:${N}"
-    echo -e "    ${C}Direct${N}  — без проксирования"
-    if $warp_ok; then
-      echo -e "    ${C}Warp${N}    — Cloudflare (пункт 15)"
-    else
-      echo -e "    ${D}Warp${N}    — ${R}не установлен${N} ${D}(требуется пункт 15)${N}"
-    fi
-    if $xray_ok; then
-      echo -e "    ${C}Xray${N}    — VLESS/VMess/Hysteria2 (пункт 17)"
-    else
-      echo -e "    ${D}Xray${N}    — ${R}не установлен${N} ${D}(требуется пункт 17)${N}"
-    fi
-    echo ""
-
-    # Собираем список клиентов
-    local clients=()
-    while IFS='|' read -r name ip; do
-      [[ -z "$name" || -z "$ip" ]] && continue
-      clients+=("$name|$ip")
-    done < <(_warp_list_awg_clients 2>/dev/null)
-
-    if [[ ${#clients[@]} -eq 0 ]]; then
-      warn "Нет клиентов AWG"
-      read -rp "Enter..."
-      return
-    fi
-
-    local i=1
-    for c in "${clients[@]}"; do
-      local name="${c%%|*}" ip="${c##*|}" route
-      route=$(_get_client_route "$ip")
-      local icon=""
-      case "$route" in
-        direct) icon="${D}○ direct${N}" ;;
-        warp)   icon="${C}◉ warp${N}" ;;
-        xray)   icon="${C}◉ xray${N}" ;;
-      esac
-      echo -e "  ${C}$i)${N} $name  ${D}($ip)${N}  →  $icon"
-      ((i++))
-    done
-    echo ""
-    echo -e "  ${C}a)${N} Направить ВСЕХ в Direct"
-    echo -e "  ${C}w)${N} Направить ВСЕХ в Warp"
-    echo -e "  ${C}x)${N} Направить ВСЕХ в Xray"
-    echo -e "  0) Назад"
-    echo ""
-
-    safe_read ROUTE_CHOICE "Выбери клиента [1-$((i-1)), a/w/x, 0]: "
-
-    case "${ROUTE_CHOICE:-}" in
-      0) break ;;
-      a)
-        if echo -e "${Y}Перевести ВСЕХ клиентов в Direct? [y/N]:${N}"; read -r cfm; [[ "$cfm" =~ ^[Yy]$ ]]; then
-          for c in "${clients[@]}"; do
-            _set_client_route "${c##*|}" "direct"
-          done
-          ok "Все клиенты → Direct"
-        fi
-        read -rp "Enter..."
-        ;;
-      w)
-        if ! $warp_ok; then
-          err "Warp не установлен! Сначала настрой Warp (пункт 15)"
-        else
-          if echo -e "${Y}Перевести ВСЕХ клиентов в Warp? [y/N]:${N}"; read -r cfm; [[ "$cfm" =~ ^[Yy]$ ]]; then
-            for c in "${clients[@]}"; do
-              _set_client_route "${c##*|}" "warp"
-            done
-            _warp_apply_peer_rules 2>/dev/null || true
-            ok "Все клиенты → Warp"
-          fi
-        fi
-        read -rp "Enter..."
-        ;;
-      x)
-        if ! $xray_ok; then
-          err "Xray не установлен! Сначала настрой Xray (пункт 17)"
-        else
-          if echo -e "${Y}Перевести ВСЕХ клиентов в Xray? [y/N]:${N}"; read -r cfm; [[ "$cfm" =~ ^[Yy]$ ]]; then
-            for c in "${clients[@]}"; do
-              _set_client_route "${c##*|}" "xray"
-            done
-            _xray_apply_peer_rules 2>/dev/null || true
-            ok "Все клиенты → Xray"
-          fi
-        fi
-        read -rp "Enter..."
-        ;;
-      *)
-        local idx=$((ROUTE_CHOICE))
-        if [[ "$idx" -ge 1 && "$idx" -le "${#clients[@]}" ]]; then
-          local c="${clients[$((idx-1))]}" name="${c%%|*}" ip="${c##*|}" cur
-          cur=$(_get_client_route "$ip")
-          echo ""
-          echo -e "  ${W}Клиент: $name ($ip)${N}"
-          echo -e "  Текущий маршрут: $cur"
-          echo ""
-          echo -e "  ${C}1)${N} Direct"
-          echo -e "  ${C}2)${N} Warp"
-          echo -e "  ${C}3)${N} Xray"
-          echo ""
-          safe_read NEW_ROUTE "Выбери новый маршрут [1-3]: "
-          case "${NEW_ROUTE:-}" in
-            1) _set_client_route "$ip" "direct"; ok "$name → Direct" ;;
-            2)
-              if ! $warp_ok; then
-                err "Warp не установлен! (пункт 15)"
-              else
-                _set_client_route "$ip" "warp"; _warp_apply_peer_rules 2>/dev/null || true
-                ok "$name → Warp"
-              fi
-              ;;
-            3)
-              if ! $xray_ok; then
-                err "Xray не установлен! (пункт 17)"
-              else
-                _set_client_route "$ip" "xray"; _xray_apply_peer_rules 2>/dev/null || true
-                ok "$name → Xray"
-              fi
-              ;;
-            *) warn "Неверный выбор" ;;
-          esac
-          read -rp "Enter..."
-        fi
-        ;;
-    esac
-  done
-  set -e
-}
-
 _xray_remove_peer_rules() {
   if [[ -f "$XRAY_PEERS" ]]; then
     while read -r ip; do
@@ -7073,7 +6899,6 @@ while true; do
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
     17)  do_xray_menu ;;
-    18)  do_client_routing_menu ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
