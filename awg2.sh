@@ -6190,11 +6190,13 @@ _xray_install() {
 {
   "inbounds": [
     {
-      "port": 10808,
-      "protocol": "socks",
+      "protocol": "tun",
+      "tag": "tun-in",
       "settings": {
-        "auth": "noauth",
-        "udp": true
+        "interface_name": "xray0",
+        "mtu": 1200,
+        "stack": "system",
+        "address": ["172.16.250.1/30"]
       },
       "sniffing": {
         "enabled": true,
@@ -6202,12 +6204,12 @@ _xray_install() {
       }
     },
     {
-      "protocol": "dokodemo-door",
-      "tag": "xray0",
-      "port": 12345,
+      "port": 10808,
+      "protocol": "socks",
+      "tag": "socks-in",
       "settings": {
-        "network": "tcp,udp",
-        "followRedirect": true
+        "auth": "noauth",
+        "udp": true
       },
       "sniffing": {
         "enabled": true,
@@ -6226,7 +6228,7 @@ _xray_install() {
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["xray0"],
+        "inboundTag": ["tun-in"],
         "outboundTag": "proxy"
       }
     ]
@@ -6442,7 +6444,7 @@ if proxy_rule:
     proxy_rule.pop('outboundTag', None)
     proxy_rule['balancerTag'] = 'balancer'
 else:
-    rules.append({'type': 'field', 'inboundTag': ['xray0'], 'balancerTag': 'balancer'})
+    rules.append({'type': 'field', 'inboundTag': ['tun-in'], 'balancerTag': 'balancer'})
 conf['routing']['rules'] = rules
 with open('$XRAY_CONF', 'w') as f:
     json.dump(conf, f, indent=2)
@@ -6481,52 +6483,74 @@ _xray_up() {
     return 1
   fi
 
-  info "Запускаем tun2proxy для интеграции с Xray..."
-  if ! command -v tun2proxy &>/dev/null; then
-    info "Скачиваем tun2proxy..."
-    if ! command -v unzip &>/dev/null; then
-      apt-get update >/dev/null 2>&1
-      apt-get install -y unzip >/dev/null 2>&1
-    fi
-    wget -qO /tmp/tun2proxy.zip "https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-x86_64-unknown-linux-musl.zip"
-    unzip -qo /tmp/tun2proxy.zip tun2proxy-x86_64-unknown-linux-musl -d /tmp/
-    mv /tmp/tun2proxy-x86_64-unknown-linux-musl /usr/local/bin/tun2proxy
-    chmod +x /usr/local/bin/tun2proxy
-    rm -f /tmp/tun2proxy.zip
+  # Проверяем, есть ли TUN inbound в конфиге
+  if ! python3 -c "import json; conf=json.load(open('$XRAY_CONF')); tun=[i for i in conf.get('inbounds',[]) if i.get('protocol')=='tun']; exit(0 if tun else 1)" 2>/dev/null; then
+    info "Миграция конфига Xray: добавляем TUN-вход..."
+    python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+# Добавляем TUN inbound первым
+tun_in = {
+    'protocol': 'tun',
+    'tag': 'tun-in',
+    'settings': {
+        'interface_name': 'xray0',
+        'mtu': 1200,
+        'stack': 'system',
+        'address': ['172.16.250.1/30']
+    },
+    'sniffing': {'enabled': True, 'destOverride': ['http', 'tls', 'quic']}
+}
+inbounds = conf.get('inbounds', [])
+# Удаляем старый dokodemo-door xray0 если есть
+inbounds = [i for i in inbounds if not (i.get('tag') == 'xray0' and i.get('protocol') == 'dokodemo-door')]
+conf['inbounds'] = [tun_in] + inbounds
+
+# Обновляем routing rules: xray0 → tun-in
+for r in conf.get('routing', {}).get('rules', []):
+    if r.get('inboundTag') == ['xray0']:
+        r['inboundTag'] = ['tun-in']
+    elif 'inboundTag' in r and 'xray0' in r['inboundTag']:
+        r['inboundTag'] = ['tun-in' if t == 'xray0' else t for t in r['inboundTag']]
+
+with open('$XRAY_CONF', 'w') as f:
+    json.dump(conf, f, indent=2)
+" && ok "Конфиг Xray обновлён (добавлен TUN-вход)" || { err "Ошибка миграции конфига"; return 1; }
   fi
 
-  ip tuntap add dev xray0 mode tun || true
-  ip addr add 172.16.250.1/30 dev xray0 || true
-  ip link set dev xray0 mtu 1200 up || true
-
+  # Запускаем Xray — он сам создаст TUN-интерфейс согласно конфигу
   systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
-  sleep 1
+  sleep 2
 
   if ! systemctl is-active --quiet awg-xray.service; then
     err "Не удалось запустить Xray. Логи: journalctl -u awg-xray.service"
-    ip link delete xray0 2>/dev/null || true
     return 1
   fi
 
-  systemd-run --unit=awg-tun2proxy.service /usr/local/bin/tun2proxy --tun xray0 --proxy socks5://127.0.0.1:10808 >/dev/null 2>&1
-  sleep 1
-  if ! systemctl is-active --quiet awg-tun2proxy.service; then
-    warn "tun2proxy не стартовал штатно. Логи: journalctl -u awg-tun2proxy.service"
+  # Ищем TUN-интерфейс, созданный Xray (ищем по адресу 172.16.250.1)
+  local tun_dev
+  tun_dev=$(ip -o addr show to 172.16.250.1 2>/dev/null | awk '{print $2}' || true)
+  if [[ -z "$tun_dev" ]]; then
+    err "Не удалось найти TUN-интерфейс Xray (ожидается адрес 172.16.250.1)"
+    err "Проверь конфиг Xray: cat $XRAY_CONF"
+    systemctl stop awg-xray.service 2>/dev/null || true
+    return 1
   fi
+  info "TUN-интерфейс: $tun_dev"
 
-  sysctl -w net.ipv4.conf.xray0.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf."$tun_dev".rp_filter=2 >/dev/null 2>&1 || true
 
   # Настройка маршрутизации для клиентов
-  iptables -t nat -C POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE
-  iptables -C FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i awg0 -o xray0 -j ACCEPT
-  iptables -C FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i xray0 -o awg0 -j ACCEPT
+  iptables -t nat -C POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE
+  iptables -C FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i awg0 -o "$tun_dev" -j ACCEPT
+  iptables -C FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$tun_dev" -o awg0 -j ACCEPT
   iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
     iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu
 
-  ip route add default dev xray0 table 201 2>/dev/null || true
+  ip route add default dev "$tun_dev" table 201 2>/dev/null || true
   ip rule add from "$client_net" table 201 priority 201 2>/dev/null || true
 
   _xray_sync_peers 2>/dev/null || true
@@ -6545,36 +6569,36 @@ _xray_up() {
   echo "active" > "$XRAY_STATE"
   echo "client_net=$client_net" >> "$XRAY_STATE"
   echo "iface=$iface" >> "$XRAY_STATE"
+  echo "tun_dev=$tun_dev" >> "$XRAY_STATE"
 
-  ok "Xray активен: $peer_count клиент(ов) через Xray"
+  ok "Xray активен (TUN: $tun_dev): $peer_count клиент(ов) через Xray"
 }
 
 _xray_down() {
+  local tun_dev
   if [[ -f "$XRAY_STATE" ]]; then
     client_net=$(grep "^client_net=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
     iface=$(grep "^iface=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+    tun_dev=$(grep "^tun_dev=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || echo "xray0")
     _xray_remove_peer_rules
     if [[ -n "$client_net" ]]; then
-      iptables -t nat -D POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || true
-      iptables -D FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || true
-      iptables -D FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || true
       iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
     fi
-    ip route del default dev xray0 table 201 2>/dev/null || true
+    ip route del default dev "$tun_dev" table 201 2>/dev/null || true
     ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
-  fi
-
-  if systemctl is-active --quiet awg-tun2proxy.service; then
-    systemctl stop awg-tun2proxy.service >/dev/null 2>&1 || true
   fi
 
   if systemctl is-active --quiet awg-xray.service; then
     systemctl stop awg-xray.service >/dev/null 2>&1 || true
   fi
 
-  if ip link show xray0 &>/dev/null; then
-    info "Удаляем xray0..."
-    ip link delete xray0 2>/dev/null || true
+  # Xray удаляет свой TUN-интерфейс при остановке, но чистим на всякий случай
+  if [[ -n "${tun_dev:-}" ]] && ip link show "$tun_dev" &>/dev/null; then
+    info "Удаляем $tun_dev..."
+    ip link delete "$tun_dev" 2>/dev/null || true
   fi
 
   rm -f "$XRAY_STATE" 2>/dev/null
