@@ -6592,7 +6592,7 @@ _xray_install() {
       "tag": "tun-in",
       "settings": {
         "mtu": 1200,
-        "stack": "system",
+        "stack": "gvisor",
         "address": ["172.16.250.1/30"]
       },
       "sniffing": {
@@ -6892,7 +6892,7 @@ tun_in = {
     'tag': 'tun-in',
     'settings': {
         'mtu': 1200,
-        'stack': 'system',
+        'stack': 'gvisor',
         'address': ['172.16.250.1/30']
     },
     'sniffing': {'enabled': True, 'destOverride': ['http', 'tls', 'quic']}
