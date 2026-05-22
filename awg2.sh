@@ -6508,6 +6508,15 @@ if proxy_rule:
 else:
     rules.append({'type': 'field', 'inboundTag': ['tun-in'], 'balancerTag': 'balancer'})
 conf['routing']['rules'] = rules
+
+# leastPing/leastLoad требуют observatory
+if strategy in ('leastPing', 'leastLoad'):
+    conf['observatory'] = {
+        'subjectSelector': ['outbound'],
+        'probeUrl': 'https://www.google.com/generate_204',
+        'probeInterval': '1m'
+    }
+
 with open('$XRAY_CONF', 'w') as f:
     json.dump(conf, f, indent=2)
 " "$tags" "$strategy"
