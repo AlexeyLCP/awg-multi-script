@@ -6463,15 +6463,33 @@ _xray_setup_balancer() {
     return 0
   fi
 
-  info "Настраиваем балансировщик (random) для следующих outbounds:"
+  info "Настраиваем балансировщик для следующих outbounds:"
   echo "$tags" | sed 's/^/  - /'
+  echo ""
+
+  echo -e "  ${C}Стратегия балансировки:${N}"
+  echo -e "  ${C}1)${N} random     — случайный выбор при каждом соединении"
+  echo -e "  ${C}2)${N} roundRobin — по очереди (каждое новое соединение — следующий)"
+  echo -e "  ${C}3)${N} leastPing  — на least загруженный (нужен observatory)"
+  echo -e "  ${C}4)${N} leastLoad  — на least загруженный (нужен observatory)"
+  echo ""
+
+  local strategy
+  read_choice BAL_STRATEGY "$(echo -e "${C}  Выбор стратегии [1-4] (Enter = random): ${N}")" 1 4 1
+  case $BAL_STRATEGY in
+    1) strategy="random" ;;
+    2) strategy="roundRobin" ;;
+    3) strategy="leastPing" ;;
+    4) strategy="leastLoad" ;;
+  esac
 
   python3 -c "
 import json, sys
 conf = json.load(open('$XRAY_CONF'))
 tags = sys.argv[1].strip().split('\n')
+strategy = sys.argv[2]
 conf.setdefault('routing', {})
-conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': 'random'}}]
+conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': strategy}}]
 rules = conf['routing'].get('rules', [])
 proxy_rule = next((r for r in rules if (r.get('outboundTag') and r.get('outboundTag') != 'direct') or r.get('balancerTag') == 'balancer'), None)
 if proxy_rule:
@@ -6482,10 +6500,10 @@ else:
 conf['routing']['rules'] = rules
 with open('$XRAY_CONF', 'w') as f:
     json.dump(conf, f, indent=2)
-" "$tags"
+" "$tags" "$strategy"
 
   if [[ $? -eq 0 ]]; then
-    ok "Балансировщик успешно настроен. Трафик будет распределяться между добавленными outbounds."
+    ok "Балансировщик ($strategy) настроен. Трафик распределяется между $(echo "$tags" | wc -l) outbounds."
   else
     err "Ошибка настройки балансировщика."
   fi
