@@ -6603,7 +6603,8 @@ _xray_install() {
       }
     },
     {
-      "port": 10808,
+      "listen": "127.0.0.1",
+      "port": 10101,
       "protocol": "socks",
       "tag": "socks-in",
       "settings": {
@@ -6987,6 +6988,28 @@ with open('$XRAY_CONF', 'w') as f:
     json.dump(conf, f, indent=2)
 " && ok "Конфиг Xray обновлён (добавлен TUN-вход)" || { err "Ошибка миграции конфига"; return 1; }
   fi
+
+  # Динамический MTU: наследуем от awg0 с запасом на WG-оверхед
+  local awg_mtu tun_mtu
+  awg_mtu=$(ip link show awg0 2>/dev/null | grep -oP 'mtu \K\d+' || echo 1320)
+  tun_mtu=$((awg_mtu - 80))
+  [[ $tun_mtu -lt 1000 ]] && tun_mtu=1000
+  [[ $tun_mtu -gt 1400 ]] && tun_mtu=1400
+  info "TUN MTU: $tun_mtu (awg0=$awg_mtu)"
+
+  # Обновляем конфиг: MTU и SOCKS5 на 127.0.0.1:10101
+  python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+for i in conf.get('inbounds', []):
+    if i.get('protocol') == 'tun':
+        i['settings']['mtu'] = $tun_mtu
+    if i.get('protocol') == 'socks':
+        i['listen'] = '127.0.0.1'
+        i['port'] = 10101
+with open('$XRAY_CONF', 'w') as f:
+    json.dump(conf, f, indent=2)
+"
 
   # Запускаем Xray — он сам создаст TUN-интерфейс
   systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
