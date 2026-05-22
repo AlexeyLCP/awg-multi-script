@@ -6400,7 +6400,23 @@ _xray_setup_balancer() {
   info "Настраиваем балансировщик (random) для следующих outbounds:"
   echo "$tags" | sed 's/^/  - /'
 
-  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); tags='$tags'.strip().split('\n'); conf.setdefault('routing', {}); conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': 'random'}}]; rules=conf['routing'].get('rules', []); proxy_rule=next((r for r in rules if r.get('outboundTag') and not r.get('outboundTag') == 'direct' or r.get('balancerTag')=='balancer'), None); if proxy_rule: proxy_rule.pop('outboundTag', None); proxy_rule['balancerTag'] = 'balancer'; else: rules.append({'type': 'field', 'inboundTag': ['xray0'], 'balancerTag': 'balancer'}); conf['routing']['rules']=rules; json.dump(conf, open('$XRAY_CONF','w'), indent=2)"
+  python3 -c "
+import json, sys
+conf = json.load(open('$XRAY_CONF'))
+tags = sys.argv[1].strip().split('\n')
+conf.setdefault('routing', {})
+conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': 'random'}}]
+rules = conf['routing'].get('rules', [])
+proxy_rule = next((r for r in rules if (r.get('outboundTag') and r.get('outboundTag') != 'direct') or r.get('balancerTag') == 'balancer'), None)
+if proxy_rule:
+    proxy_rule.pop('outboundTag', None)
+    proxy_rule['balancerTag'] = 'balancer'
+else:
+    rules.append({'type': 'field', 'inboundTag': ['xray0'], 'balancerTag': 'balancer'})
+conf['routing']['rules'] = rules
+with open('$XRAY_CONF', 'w') as f:
+    json.dump(conf, f, indent=2)
+" "$tags"
 
   if [[ $? -eq 0 ]]; then
     ok "Балансировщик успешно настроен. Трафик будет распределяться между добавленными outbounds."

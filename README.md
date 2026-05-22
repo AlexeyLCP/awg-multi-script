@@ -24,7 +24,7 @@
 ## Быстрый старт
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
+sudo curl -fsSL https://raw.githubusercontent.com/alexeylcp/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
 ```
 
 Запуск в любой момент:
@@ -155,7 +155,7 @@ d) Удалить Warp полностью
 **Установка:**
 
 ```bash
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/alexeylcp/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
 ```
 
 **Запуск:**
@@ -216,7 +216,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 ## Проверка конфига
 
-Проверить свой `.conf` на валидность, DPI-стойкость и оптимальность параметров можно через [AWG Analyzer](https://pumbax.github.io/awg-analyzer/) — полностью локальный JS-инструмент:
+Проверить свой `.conf` на валидность, DPI-стойкость и оптимальность параметров можно через [AWG Analyzer](https://alexeylcp.github.io/awg-analyzer/) — полностью локальный JS-инструмент:
 
 - Детект версии (WireGuard / AWG 1.0 / 1.5 / 2.0) + уровень обфускации
 - Глубокий разбор I1-I5 (валидность `<b 0x...>`, лимит `<r>`, протокол)
@@ -252,5 +252,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
 **AWG Toolza v6.7.5** · MIT License
+
+*Доработки от alexeylcp (в т.ч. интеграция Xray)* · **PolyForm Noncommercial 1.0.0**
 
 </div>
