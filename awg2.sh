@@ -6933,10 +6933,10 @@ _telemt_download() {
     fi
   }
   URL=$(_url "$ARCH")
-  info "Скачиваю: $URL"
+  info "Скачиваю: $URL" >&2
   if ! curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz"; then
     if [[ "$ARCH" == "x86_64-v3" ]]; then
-      warn "Сборка x86_64-v3 не найдена, откат на x86_64..."
+      warn "Сборка x86_64-v3 не найдена, откат на x86_64..." >&2
       URL=$(_url "x86_64")
       curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz" || { err "Не удалось скачать telemt"; return 1; }
     else
@@ -6993,7 +6993,7 @@ do_telemt_install() {
   echo ""
   safe_read TELEMT_PORT "Порт (Enter=443): "
   PORT="${TELEMT_PORT:-443}"
-  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 10 || PORT > 65535 )); then
     err "Некорректный порт: $PORT"; read -rp "Enter..."; return
   fi
   _telemt_port_busy "$PORT" && { err "Порт $PORT уже занят"; read -rp "Enter..."; return; }
