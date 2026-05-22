@@ -6131,10 +6131,11 @@ do_xray_menu() {
     echo -e "  4) Настроить балансировщик"
     echo -e "  5) Включить туннель"
     echo -e "  6) Выключить туннель"
-    echo -e "  ${C}7) Управление клиентами в Xray${N}"
+    echo -e "  7) Перезапустить туннель"
+    echo -e "  ${C}8) Управление клиентами в Xray${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")"
+    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
 
     case "${XRAY_CHOICE:-}" in
       1) _xray_install; read -rp "Enter..." ;;
@@ -6143,7 +6144,8 @@ do_xray_menu() {
       4) _xray_setup_balancer; read -rp "Enter..." ;;
       5) _xray_up; read -rp "Enter..." ;;
       6) _xray_down; read -rp "Enter..." ;;
-      7) do_xray_peers_menu ;;
+      7) _xray_down 2>/dev/null; _xray_up; read -rp "Enter..." ;;
+      8) do_xray_peers_menu ;;
       0) break ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -6480,8 +6482,8 @@ _xray_setup_balancer() {
   echo -e "  ${C}Стратегия балансировки:${N}"
   echo -e "  ${C}1)${N} random     — случайный выбор при каждом соединении"
   echo -e "  ${C}2)${N} roundRobin — по очереди (каждое новое соединение — следующий)"
-  echo -e "  ${C}3)${N} leastPing  — на least загруженный (нужен observatory)"
-  echo -e "  ${C}4)${N} leastLoad  — на least загруженный (нужен observatory)"
+  echo -e "  ${C}3)${N} leastPing  — по наименьшему пингу (observatory авто)"
+  echo -e "  ${C}4)${N} leastLoad  — по наименьшей загрузке (observatory авто)"
   echo ""
 
   local strategy
