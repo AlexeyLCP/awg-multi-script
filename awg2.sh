@@ -6379,6 +6379,13 @@ new_out = json.loads(sys.argv[2])
 with open(conf_path, 'r') as f:
     conf = json.load(f)
 
+# Check for duplicate tag
+new_tag = new_out.get('tag', '')
+for out in conf.get('outbounds', []):
+    if out.get('tag') == new_tag:
+        print(f'DUPLICATE:{new_tag}')
+        sys.exit(1)
+
 # Insert before direct/freedom outbounds, or append
 inserted = False
 for i, out in enumerate(conf.get("outbounds", [])):
@@ -6400,9 +6407,12 @@ with open(conf_path, 'w') as f:
     json.dump(conf, f, indent=2)
 PYEOF2
 
-  python3 "$inject_script" "$XRAY_CONF" "$new_outbound"
+  local inject_out
+  inject_out=$(python3 "$inject_script" "$XRAY_CONF" "$new_outbound" 2>&1)
   if [[ $? -eq 0 ]]; then
     ok "Outbound '$tag' добавлен."
+  elif echo "$inject_out" | grep -q 'DUPLICATE'; then
+    err "Outbound '$tag' уже существует! Нельзя добавить дубликат."
   else
     err "Ошибка добавления outbound"
   fi
