@@ -7259,14 +7259,12 @@ _telemt_remove_route() {
   local uid=$(id -u telemt 2>/dev/null || echo "")
   # UID-based (Warp)
   [[ -n "$uid" ]] && ip rule del uidrange "$uid-$uid" table 200 2>/dev/null || true
-  # Xray upstream SOCKS5 в TOML-конфиге
+  # Xray upstream SOCKS5 в TOML-конфиге — удаляем секцию [[upstream]]
   local cfg="/etc/telemt/telemt.toml"
-  if [[ -f "$cfg" ]]; then
-    sed -i '/^\[\[upstream\]\]/,/^$/d' "$cfg"
-    sed -i '/^\[\[upstream\]\]/,$ { /^\[\[upstream\]\]/d; /^type = /d; /^address = /d; /^scopes = /d; }' "$cfg" 2>/dev/null || true
-    # Проще: удаляем все строки от [[upstream]] до следующей секции или EOF
+  if [[ -f "$cfg" ]] && grep -q '^\[\[upstream\]\]' "$cfg"; then
     local tmp="${cfg}.tmp"
     awk 'BEGIN{skip=0} /^\[\[upstream\]\]/{skip=1; next} /^\[/{if(skip){skip=0}} !skip{print}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+    systemctl restart telemt 2>/dev/null || true
   fi
 }
 
