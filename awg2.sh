@@ -6497,7 +6497,7 @@ _xray_up() {
 
   ip tuntap add dev xray0 mode tun || true
   ip addr add 172.16.250.1/30 dev xray0 || true
-  ip link set dev xray0 up || true
+  ip link set dev xray0 mtu 1200 up || true
 
   systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
   sleep 1
@@ -6523,6 +6523,8 @@ _xray_up() {
     iptables -A FORWARD -i awg0 -o xray0 -j ACCEPT
   iptables -C FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i xray0 -o awg0 -j ACCEPT
+  iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+    iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu
 
   ip route add default dev xray0 table 201 2>/dev/null || true
   ip rule add from "$client_net" table 201 priority 201 2>/dev/null || true
@@ -6556,6 +6558,7 @@ _xray_down() {
       iptables -t nat -D POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || true
       iptables -D FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || true
       iptables -D FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
     fi
     ip route del default dev xray0 table 201 2>/dev/null || true
     ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
