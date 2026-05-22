@@ -29,7 +29,7 @@
 
 **Возможности (пункт 17):**
 - **TUN-вход Xray** — встроенный gvisor-стек, без tun2proxy
-- **Балансировка** — несколько VLESS/VMess/Hysteria2 outbounds, `random` balancer
+- **Балансировка** — выбор стратегии: random / roundRobin / leastPing / leastLoad
 - **Selective routing** — выбор клиентов, которые ходят через Xray
 - **Авто-миграция** — обновление конфига Xray при запуске
 
