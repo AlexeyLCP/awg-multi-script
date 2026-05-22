@@ -7044,7 +7044,7 @@ tls_front_dir = "/opt/telemt/tlsfront"
 [access.users]
 tguser = "${SECRET}"
 TEOF
-  chown root:telemt /etc/telemt/telemt.toml && chmod 640 /etc/telemt/telemt.toml
+  chown root:telemt /etc/telemt/telemt.toml && chmod 660 /etc/telemt/telemt.toml
 
   cat > /etc/systemd/system/telemt.service << UEOF
 [Unit]
