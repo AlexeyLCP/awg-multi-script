@@ -14,9 +14,6 @@
 
 <br>
 
-[![Boosty](https://img.shields.io/badge/Boosty-Поддержать-F15F2C?style=for-the-badge&logo=boost&logoColor=white)](https://boosty.to/awgtoolza/donate)
-[![YooMoney](https://img.shields.io/badge/YooMoney-Поддержать-8B3FFC?style=for-the-badge&logo=yandex&logoColor=white)](https://yoomoney.ru/to/4100119521619579)
-
 </div>
 
 ---
@@ -228,18 +225,13 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 ---
 
-## Поддержать
+## Новые возможности (Xray)
 
-**Boosty:** https://boosty.to/awgtoolza/donate
-
-**YooMoney:** https://yoomoney.ru/to/4100119521619579
-
-| Сеть | Адрес |
-|---|---|
-| USDT TRC20 | `TN2rQAsGNHQr8wnneKRD14UMX629D2Ca5q` |
-| USDT ERC20 | `0x721845234eeC44e0a9BaE78402965828C1bc6c57` |
-| USDT TON | `UQCwj-RY2a4BH7sIDDeLb77XRaPDq0mb1FVwyC4UaOGbLMYy` |
-| TON | `UQCdQtJO4CF0Lyeb93X2zdeWeAcDJ-ieBC3AaL7LIqWfMBg3` |
+Скрипт дополнен поддержкой туннеля через Xray:
+- Добавление внешних proxy (`vless://`, `vmess://`)
+- Поддержка балансировки трафика (`random` balancer) между несколькими proxy
+- Маршрутизация выбранных клиентов AWG в туннель Xray
+- Взаимоисключающая работа с туннелем Warp.
 
 ---
 
