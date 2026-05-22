@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.7"
-UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
+VERSION="v6.8.7-lucx"
+UPDATE_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Цвета ──────────────────────────────────────────────────
