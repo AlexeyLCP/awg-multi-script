@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.5"
+VERSION="v6.8.5-f.1"
 UPDATE_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
