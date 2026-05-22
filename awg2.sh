@@ -6558,6 +6558,12 @@ _xray_install() {
   chmod +x /usr/local/bin/xray
   rm -f /tmp/xray.zip
 
+  if ! command -v python3 &>/dev/null; then
+    info "Устанавливаем python3..."
+    apt-get update >/dev/null 2>&1
+    apt-get install -y python3 >/dev/null 2>&1
+  fi
+
   mkdir -p "$XRAY_DIR"
   cat > "$XRAY_CONF" << 'JSONEOF'
 {
@@ -6575,11 +6581,16 @@ _xray_install() {
       }
     },
     {
-      "protocol": "tun",
+      "protocol": "dokodemo-door",
       "tag": "xray0",
+      "port": 12345,
       "settings": {
-        "name": "xray0",
-        "ips": ["172.16.250.2/30"]
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
@@ -6849,12 +6860,20 @@ _xray_up() {
     return 1
   fi
 
-  info "Запускаем Xray..."
+  info "Запускаем tun2proxy для интеграции с Xray..."
+  if ! command -v tun2proxy &>/dev/null; then
+    info "Скачиваем tun2proxy..."
+    wget -qO /tmp/tun2proxy.tar.gz "https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-linux-amd64.tar.gz"
+    tar -xzf /tmp/tun2proxy.tar.gz -C /usr/local/bin/ tun2proxy
+    chmod +x /usr/local/bin/tun2proxy
+    rm -f /tmp/tun2proxy.tar.gz
+  fi
+
   ip tuntap add dev xray0 mode tun || true
   ip addr add 172.16.250.1/30 dev xray0 || true
   ip link set dev xray0 up || true
 
-  systemd-run --unit=awg-xray.service --remain-after-exit /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
+  systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
   sleep 1
 
   if ! systemctl is-active --quiet awg-xray.service; then
@@ -6863,9 +6882,15 @@ _xray_up() {
     return 1
   fi
 
+  systemd-run --unit=awg-tun2proxy.service /usr/local/bin/tun2proxy --tun xray0 --proxy socks5://127.0.0.1:10808 >/dev/null 2>&1
+  sleep 1
+  if ! systemctl is-active --quiet awg-tun2proxy.service; then
+    warn "tun2proxy не стартовал штатно. Логи: journalctl -u awg-tun2proxy.service"
+  fi
+
   sysctl -w net.ipv4.conf.xray0.rp_filter=2 >/dev/null 2>&1 || true
 
-  # Настройка маршрутизации для клиентов, аналогично warp0
+  # Настройка маршрутизации для клиентов
   iptables -t nat -C POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE
   iptables -C FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || \
@@ -6908,11 +6933,12 @@ _xray_down() {
     ip route del default dev xray0 table 201 2>/dev/null || true
   fi
 
+  if systemctl is-active --quiet awg-tun2proxy.service; then
+    systemctl stop awg-tun2proxy.service >/dev/null 2>&1 || true
+  fi
+
   if systemctl is-active --quiet awg-xray.service; then
     systemctl stop awg-xray.service >/dev/null 2>&1 || true
-    systemctl disable awg-xray.service >/dev/null 2>&1 || true
-    rm -f /run/systemd/system/awg-xray.service 2>/dev/null || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
   if ip link show xray0 &>/dev/null; then
