@@ -6416,9 +6416,14 @@ if not inserted:
 # Update routing to proxy traffic to newly added proxy
 proxy_rule = next((r for r in conf.get('routing', {}).get('rules', []) if r.get('outboundTag') and not r.get('outboundTag') == 'direct' or r.get('balancerTag') == 'balancer'), None)
 if proxy_rule:
-    # Set outboundTag directly to new outbound instead of abstract proxy (unless balancer is active)
     if 'balancerTag' not in proxy_rule:
         proxy_rule['outboundTag'] = new_out['tag']
+else:
+    # Если все правила ведут в direct — переключаем первое найденное на новый outbound
+    for r in conf.get('routing', {}).get('rules', []):
+        if r.get('outboundTag') == 'direct':
+            r['outboundTag'] = new_out['tag']
+            break
 
 with open(conf_path, 'w') as f:
     json.dump(conf, f, indent=2)
@@ -6465,7 +6470,47 @@ _xray_remove_outbound() {
 
   local target="${arr[$((opt-1))]}"
   info "Удаляем '$target'..."
-  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != '$target']; json.dump(conf, open('$XRAY_CONF','w'), indent=2)"
+  python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+
+# Удаляем outbound
+conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != '$target']
+
+# Считаем оставшиеся proxy outbounds
+proxy_tags = [o['tag'] for o in conf.get('outbounds', []) if o.get('tag') and not o.get('tag').startswith('direct')]
+count = len(proxy_tags)
+
+rules = conf.setdefault('routing', {}).setdefault('rules', [])
+for r in rules:
+    if r.get('balancerTag') == 'balancer' or (r.get('outboundTag') and r.get('outboundTag') != 'direct'):
+        if count == 0:
+            # Нет проксей — всё в direct
+            r.pop('balancerTag', None)
+            r.pop('outboundTag', None)
+            r['outboundTag'] = 'direct'
+        elif count == 1:
+            # Один прокси — прямой outboundTag
+            r.pop('balancerTag', None)
+            r['outboundTag'] = proxy_tags[0]
+        else:
+            # 2+ — обновляем selector в balancer
+            r.pop('outboundTag', None)
+            r['balancerTag'] = 'balancer'
+
+# Обновляем balancer selector
+if count >= 2:
+    for b in conf.get('routing', {}).get('balancers', []):
+        b['selector'] = [t for t in b.get('selector', []) if t != '$target']
+else:
+    # Удаляем balancers если 0 или 1 прокси
+    conf['routing'].pop('balancers', None)
+    conf.pop('observatory', None)
+
+with open('$XRAY_CONF', 'w') as f:
+    json.dump(conf, f, indent=2)
+print('count=' + str(count))
+"
   ok "Outbound '$target' удалён."
 }
 
