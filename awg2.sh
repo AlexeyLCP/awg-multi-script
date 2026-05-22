@@ -1785,6 +1785,16 @@ show_menu() {
     echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ не настроен${N}"
   fi
 
+  # === XRAY ТУННЕЛЬ ===
+  echo -e "  ${C}▸ Xray туннель:${N}"
+  if ip link show xray0 &>/dev/null; then
+    echo -e "  ${C}17)${N} Xray туннель  ${G}● включен${N}"
+  elif [[ -f "$XRAY_CONF" ]]; then
+    echo -e "  ${C}17)${N} Xray туннель  ${D}○ настроен, выключен${N}"
+  else
+    echo -e "  ${C}17)${N} Xray туннель  ${D}○ не настроен${N}"
+  fi
+
   echo ""
 
   # === КАСКАД ===
