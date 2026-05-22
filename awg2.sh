@@ -1780,6 +1780,20 @@ show_menu() {
   fi
 
   echo ""
+
+  # === TELEMT ===
+  if systemctl is-active --quiet telemt 2>/dev/null; then
+    echo -e "  ${M}▸ Telemt:${N}"
+    echo -e "  ${M}18)${N} Telemt MTProto прокси  ${G}● запущен${N}"
+  elif [[ -f /etc/systemd/system/telemt.service ]]; then
+    echo -e "  ${M}▸ Telemt:${N}"
+    echo -e "  ${M}18)${N} Telemt MTProto прокси  ${D}○ установлен, выключен${N}"
+  else
+    echo -e "  ${M}▸ Telemt:${N}"
+    echo -e "  ${M}18)${N} Telemt MTProto прокси  ${D}○ не установлен${N}"
+  fi
+
+  echo ""
   echo -e "  ${W}0)${N} Выход"
   echo ""
   safe_read CHOICE "$(echo -e "${C}  Выбор: ${N}")"
@@ -6872,6 +6886,409 @@ _global_cleanup() {
   [[ -f /tmp/awg_domain_cache.txt && ! -s /tmp/awg_domain_cache.txt ]] && \
     rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
 }
+# ─────────────────────────────────────────────────────────────
+# Telemt — MTProto прокси (TLS-камуфляж для Telegram)
+# Порты: PROXY_PORT (внешний) / API_PORT=9091 (внутренний)
+# ─────────────────────────────────────────────────────────────
+
+TELEMT_API_PORT="9091"
+
+_telemt_detect_arch() {
+  local a=$(uname -m)
+  case "$a" in
+    x86_64|amd64)
+      if grep -q "avx2" /proc/cpuinfo 2>/dev/null && grep -q "bmi2" /proc/cpuinfo 2>/dev/null; then
+        echo "x86_64-v3"; else echo "x86_64"; fi ;;
+    aarch64|arm64) echo "aarch64" ;;
+    *) echo ""; return 1 ;;
+  esac
+}
+
+_telemt_detect_libc() {
+  for f in /lib/ld-musl-*.so.* /lib64/ld-musl-*.so.*; do
+    [[ -e "$f" ]] && { echo "musl"; return 0; }
+  done
+  grep -qE '^ID="?alpine"?' /etc/os-release 2>/dev/null && { echo "musl"; return 0; }
+  ldd --version 2>&1 | grep -qi musl && { echo "musl"; return 0; }
+  echo "gnu"
+}
+
+_telemt_port_busy() { ss -tlnp 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+
+_telemt_get_public_ip() {
+  curl -s -4 --max-time 5 ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 5 api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 5 ipinfo.io/ip 2>/dev/null
+}
+
+_telemt_download() {
+  local VERSION="$1" TMP="$2" ARCH LIBC URL
+  ARCH=$(_telemt_detect_arch) || { err "Неподдерживаемая архитектура: $(uname -m)"; return 1; }
+  LIBC=$(_telemt_detect_libc)
+  _url() { local arch="$1"
+    if [[ "$VERSION" == "latest" ]]; then
+      echo "https://github.com/telemt/telemt/releases/latest/download/telemt-${arch}-linux-${LIBC}.tar.gz"
+    else
+      echo "https://github.com/telemt/telemt/releases/download/${VERSION}/telemt-${arch}-linux-${LIBC}.tar.gz"
+    fi
+  }
+  URL=$(_url "$ARCH")
+  info "Скачиваю: $URL"
+  if ! curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz"; then
+    if [[ "$ARCH" == "x86_64-v3" ]]; then
+      warn "Сборка x86_64-v3 не найдена, откат на x86_64..."
+      URL=$(_url "x86_64")
+      curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz" || { err "Не удалось скачать telemt"; return 1; }
+    else
+      err "Не удалось скачать telemt"; return 1
+    fi
+  fi
+  tar -xzf "${TMP}/telemt.tar.gz" -C "$TMP" || { err "Ошибка распаковки"; return 1; }
+  rm -f "${TMP}/telemt.tar.gz"
+  find "$TMP" -type f -name "telemt" -print 2>/dev/null | head -1
+}
+
+_telemt_install_bin() {
+  install -m 0755 "$1" /usr/local/bin/telemt || return 1
+  setcap cap_net_bind_service,cap_net_admin=+ep /usr/local/bin/telemt 2>/dev/null || true
+}
+
+_telemt_ensure_deps() {
+  local pkgs=()
+  command -v curl    &>/dev/null || pkgs+=("curl")
+  command -v jq      &>/dev/null || pkgs+=("jq")
+  command -v openssl &>/dev/null || pkgs+=("openssl")
+  command -v setcap  &>/dev/null || pkgs+=("libcap2-bin")
+  [[ ${#pkgs[@]} -gt 0 ]] && { DEBIAN_FRONTEND=noninteractive apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; }
+}
+
+do_telemt_install() {
+  if systemctl is-active --quiet telemt 2>/dev/null; then
+    warn "Telemt уже запущен. Сначала удали (пункт 6)."; read -rp "Enter..."; return
+  fi
+
+  local TLS_DOMAIN PORT MIDDLE_PROXY="true"
+  echo ""
+  echo -e "  ${C}Домены маскировки TLS:${N}"
+  echo "    1. www.gosuslugi.ru  (по умолчанию)"
+  echo "    2. www.sberbank.ru   3. www.tinkoff.ru"
+  echo "    4. www.yandex.ru     5. www.ozon.ru"
+  echo "    6. www.wildberries.ru"
+  echo "    7. www.cloudflare.com"
+  echo "    11. Свой домен"
+  read_choice TELEMT_DOMAIN "$(echo -e "${C}  Выбор [1-7,11] (Enter=1): ${N}")" 1 11 1
+  case $TELEMT_DOMAIN in
+    2) TLS_DOMAIN="www.sberbank.ru" ;; 3) TLS_DOMAIN="www.tinkoff.ru" ;;
+    4) TLS_DOMAIN="www.yandex.ru" ;; 5) TLS_DOMAIN="www.ozon.ru" ;;
+    6) TLS_DOMAIN="www.wildberries.ru" ;; 7) TLS_DOMAIN="www.cloudflare.com" ;;
+    11) read -rp "  Домен: " TLS_DOMAIN; [[ -z "$TLS_DOMAIN" ]] && TLS_DOMAIN="www.gosuslugi.ru" ;;
+    *) TLS_DOMAIN="www.gosuslugi.ru" ;;
+  esac
+  info "Домен маскировки: $TLS_DOMAIN"
+
+  echo ""
+  local PORTS=(443 8443 2053 2083 2087 8080)
+  echo -e "  ${C}Статус портов:${N}"
+  for p in "${PORTS[@]}"; do _telemt_port_busy "$p" && echo "    [занят] $p" || echo "    [свободен] $p"; done
+  echo ""
+  safe_read TELEMT_PORT "Порт (Enter=443): "
+  PORT="${TELEMT_PORT:-443}"
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    err "Некорректный порт: $PORT"; read -rp "Enter..."; return
+  fi
+  _telemt_port_busy "$PORT" && { err "Порт $PORT уже занят"; read -rp "Enter..."; return; }
+  info "Порт: $PORT"
+
+  _telemt_ensure_deps
+
+  local TMP=$(mktemp -d)
+  local EXTRACTED=$(_telemt_download "latest" "$TMP") || { rm -rf "$TMP"; read -rp "Enter..."; return; }
+  _telemt_install_bin "$EXTRACTED" || { err "Ошибка установки бинаря"; rm -rf "$TMP"; read -rp "Enter..."; return; }
+  rm -rf "$TMP"
+
+  local PUBLIC_IP=$(_telemt_get_public_ip)
+  [[ -z "$PUBLIC_IP" ]] && { err "Не удалось определить публичный IP"; read -rp "Enter..."; return; }
+
+  getent group telemt &>/dev/null || groupadd -r telemt
+  id telemt &>/dev/null || useradd -r -g telemt -d /opt/telemt -s /bin/false -c "Telemt Proxy" telemt
+  mkdir -p /opt/telemt/tlsfront && chown -R telemt:telemt /opt/telemt && chmod 750 /opt/telemt /opt/telemt/tlsfront
+
+  local SECRET=$(openssl rand -hex 16)
+  mkdir -p /etc/telemt
+  cat > /etc/telemt/telemt.toml << TEOF
+[general]
+use_middle_proxy = ${MIDDLE_PROXY}
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+public_host = "${PUBLIC_IP}"
+
+[server]
+port = ${PORT}
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:${TELEMT_API_PORT}"
+whitelist = ["127.0.0.1/32"]
+
+[censorship]
+tls_domain = "${TLS_DOMAIN}"
+mask = true
+tls_emulation = true
+tls_front_dir = "/opt/telemt/tlsfront"
+
+[access.users]
+tguser = "${SECRET}"
+TEOF
+  chown root:telemt /etc/telemt/telemt.toml && chmod 640 /etc/telemt/telemt.toml
+
+  cat > /etc/systemd/system/telemt.service << UEOF
+[Unit]
+Description=Telemt MTProto Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt
+Group=telemt
+WorkingDirectory=/opt/telemt
+ExecStart=/usr/local/bin/telemt /etc/telemt/telemt.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UEOF
+  chmod 644 /etc/systemd/system/telemt.service
+  systemctl daemon-reload && systemctl enable --now telemt
+  sleep 4
+
+  if ! systemctl is-active --quiet telemt; then
+    err "Сервис не запустился. journalctl -u telemt -n 30"; read -rp "Enter..."; return
+  fi
+
+  local LINK=$(curl -s --max-time 5 "http://127.0.0.1:${TELEMT_API_PORT}/v1/users" \
+    | jq -r '.data[0].links.tls[]? | select(test("server=[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"))' 2>/dev/null | head -1 || true)
+
+  echo ""
+  ok "Telemt установлен и запущен!"
+  echo -e "  Порт:      ${W}$PORT${N}"
+  echo -e "  TLS домен: ${W}$TLS_DOMAIN${N}"
+  echo -e "  Пользователь: ${W}tguser${N}  Секрет: ${W}$SECRET${N}"
+  [[ -n "$LINK" ]] && echo -e "  ${G}${LINK}${N}"
+  echo ""
+  read -rp "Enter..."
+}
+
+do_telemt_links() {
+  if ! systemctl is-active --quiet telemt 2>/dev/null; then err "Telemt не запущен."; read -rp "Enter..."; return; fi
+  local RAW=$(curl -s --max-time 5 "http://127.0.0.1:${TELEMT_API_PORT}/v1/users" 2>/dev/null)
+  if [[ -z "$RAW" ]] || ! echo "$RAW" | jq -e '.ok' &>/dev/null; then err "API не ответил"; read -rp "Enter..."; return; fi
+  echo ""
+  echo -e "${C}======= Ссылки клиентов =======${N}"
+  echo "$RAW" | jq -r '.data[] | "  [" + .username + "]", (.links.tls[]? | select(test("server=[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"))), ""' 2>/dev/null
+  local S=$(curl -s --max-time 5 "http://127.0.0.1:${TELEMT_API_PORT}/v1/stats/summary" 2>/dev/null)
+  if echo "$S" | jq -e '.ok' &>/dev/null; then
+    echo -e "${C}======= Сервер =======${N}"
+    echo "  uptime: $(echo "$S" | jq -r '.data.uptime_seconds | floor')с | подключений: $(echo "$S" | jq -r '.data.connections_total')"
+    echo ""
+  fi
+  echo -e "${C}======= Статистика =======${N}"
+  echo "$RAW" | jq -r '.data[] | "  " + .username + " | онлайн: " + (.current_connections|tostring) + " | IP: " + (.recent_unique_ips|tostring) + " | трафик: " + ((.total_octets / 1048576 * 100 | round) / 100 | tostring) + " MB"' 2>/dev/null
+  echo ""
+  read -rp "Enter..."
+}
+
+do_telemt_add_client() {
+  if ! systemctl is-active --quiet telemt 2>/dev/null; then err "Telemt не запущен."; read -rp "Enter..."; return; fi
+  safe_read TELEMT_NEW_USER "Имя клиента [A-Za-z0-9_.-]: "
+  [[ -z "$TELEMT_NEW_USER" ]] && { err "Имя не может быть пустым"; read -rp "Enter..."; return; }
+  if [[ ! "$TELEMT_NEW_USER" =~ ^[A-Za-z0-9_.-]+$ ]] || (( ${#TELEMT_NEW_USER} > 64 )); then
+    err "Допустимы A-Za-z0-9_.- длиной до 64"; read -rp "Enter..."; return
+  fi
+  local RESP=$(curl -s --max-time 5 -X POST -H "Content-Type: application/json" \
+    -d "{\"username\":\"${TELEMT_NEW_USER}\"}" "http://127.0.0.1:${TELEMT_API_PORT}/v1/users")
+  if ! echo "$RESP" | jq -e '.ok' &>/dev/null; then
+    err "Ошибка: $(echo "$RESP" | jq -r '.error.message // "неизвестная"' 2>/dev/null)"; read -rp "Enter..."; return
+  fi
+  local S=$(echo "$RESP" | jq -r '.data.secret // empty')
+  local L=$(echo "$RESP" | jq -r '.data.user.links.tls[]? | select(test("server=[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"))' 2>/dev/null | head -1)
+  echo ""
+  ok "Клиент '$TELEMT_NEW_USER' добавлен!"
+  [[ -n "$S" ]] && echo -e "  Секрет: ${W}$S${N}"
+  [[ -n "$L" ]] && echo -e "  ${G}${L}${N}"
+  echo ""; read -rp "Enter..."
+}
+
+do_telemt_del_client() {
+  if ! systemctl is-active --quiet telemt 2>/dev/null; then err "Telemt не запущен."; read -rp "Enter..."; return; fi
+  echo ""
+  local RAW=$(curl -s --max-time 5 "http://127.0.0.1:${TELEMT_API_PORT}/v1/users" 2>/dev/null)
+  if ! echo "$RAW" | jq -e '.ok' &>/dev/null; then err "API не ответил"; read -rp "Enter..."; return; fi
+  echo -e "${C}Текущие клиенты:${N}"
+  echo "$RAW" | jq -r '.data[].username' 2>/dev/null | sed 's/^/  /'
+  echo ""
+  safe_read TELEMT_DEL_USER "Имя клиента для удаления: "
+  [[ -z "$TELEMT_DEL_USER" ]] && { err "Имя не может быть пустым"; return; }
+  echo -ne "${R}Удалить '$TELEMT_DEL_USER'? [y/N]: ${N}"; read -r cfm
+  [[ "$cfm" != "y" && "$cfm" != "Y" ]] && { warn "Отменено."; read -rp "Enter..."; return; }
+  local RESP=$(curl -s --max-time 5 -X DELETE "http://127.0.0.1:${TELEMT_API_PORT}/v1/users/${TELEMT_DEL_USER}")
+  if echo "$RESP" | jq -e '.ok' &>/dev/null; then ok "Клиент '$TELEMT_DEL_USER' удалён."
+  else err "Ошибка: $(echo "$RESP" | jq -r '.error.message // "неизвестная"' 2>/dev/null)"; fi
+  read -rp "Enter..."
+}
+
+_telemt_do_binary_update() {
+  local VERSION="$1" TMP=$(mktemp -d)
+  local EXTRACTED=$(_telemt_download "$VERSION" "$TMP") || { rm -rf "$TMP"; return 1; }
+  systemctl stop telemt 2>/dev/null || true
+  _telemt_install_bin "$EXTRACTED" || { err "Ошибка установки бинаря"; systemctl start telemt 2>/dev/null; rm -rf "$TMP"; return 1; }
+  systemctl start telemt; sleep 3; rm -rf "$TMP"
+  if systemctl is-active --quiet telemt; then return 0
+  else err "Сервис не запустился. journalctl -u telemt -n 30"; return 1; fi
+}
+
+do_telemt_update() {
+  if [[ ! -f /etc/systemd/system/telemt.service ]]; then err "Telemt не установлен"; read -rp "Enter..."; return; fi
+  local CURRENT=$(curl -s --max-time 5 "http://127.0.0.1:${TELEMT_API_PORT}/v1/system/info" | jq -r '.data.version // "?"' 2>/dev/null)
+  local LATEST=$(curl -s --max-time 10 "https://api.github.com/repos/telemt/telemt/releases/latest" | jq -r '.tag_name // "?"')
+  echo ""
+  echo -e "  Установлена: ${W}${CURRENT#v}${N}    Последняя: ${W}${LATEST#v}${N}"
+  if [[ "${CURRENT#v}" == "${LATEST#v}" && "$LATEST" != "?" ]]; then info "Уже последняя версия."; read -rp "Enter..."; return; fi
+  echo ""
+  echo -ne "${C}  Обновить до ${LATEST#v}? [y/N]: ${N}"; read -r cfm
+  [[ "$cfm" != "y" && "$cfm" != "Y" ]] && { warn "Отменено."; read -rp "Enter..."; return; }
+  _telemt_do_binary_update "latest" && ok "Telemt обновлён до ${LATEST#v}" || err "Ошибка обновления"
+  read -rp "Enter..."
+}
+
+do_telemt_remove() {
+  echo -ne "${R}Удалить Telemt полностью? [y/N]: ${N}"; read -r cfm
+  [[ "$cfm" != "y" && "$cfm" != "Y" ]] && { warn "Отменено."; return; }
+  systemctl stop telemt 2>/dev/null || true
+  systemctl disable telemt 2>/dev/null || true
+  rm -f /etc/systemd/system/telemt.service
+  rm -rf /etc/telemt /opt/telemt /usr/local/bin/telemt
+  id telemt &>/dev/null && userdel telemt 2>/dev/null || true
+  getent group telemt &>/dev/null && groupdel telemt 2>/dev/null || true
+  crontab -l 2>/dev/null | grep -v "telemt-autoupdate" | crontab - 2>/dev/null || true
+  rm -f /usr/local/bin/telemt-autoupdate.sh /var/lock/telemt-autoupdate.lock
+  systemctl daemon-reload
+  ok "Telemt полностью удалён."
+  read -rp "Enter..."
+}
+
+do_telemt_autoupdate() {
+  local IS_ENABLED=false
+  crontab -l 2>/dev/null | grep -q "telemt-autoupdate" && IS_ENABLED=true
+  echo ""
+  $IS_ENABLED && echo -e "  Автообновление: ${G}ВКЛЮЧЕНО${N} (каждые 3 часа)" || echo -e "  Автообновление: ${D}ВЫКЛЮЧЕНО${N}"
+  echo ""
+  echo "  1) Включить автообновление"
+  echo "  2) Выключить автообновление"
+  echo "  3) Показать лог"
+  echo "  0) Назад"
+  safe_read AU_CHOICE "Выбор [0-3]: "
+  case "${AU_CHOICE:-}" in
+    1)
+      command -v crontab &>/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cron; systemctl enable --now cron 2>/dev/null || true; }
+      command -v flock &>/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq util-linux 2>/dev/null || true
+      cat > /usr/local/bin/telemt-autoupdate.sh << 'AUSH'
+#!/bin/bash
+set -o pipefail
+LOG="/var/log/telemt-autoupdate.log"
+LOCK="/var/lock/telemt-autoupdate.lock"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
+exec 200>"$LOCK"; flock -n 200 || { log "Другой экземпляр уже работает"; exit 0; }
+norm_ver() { echo "${1#v}"; }
+detect_arch() {
+  local a=$(uname -m)
+  case "$a" in x86_64|amd64) grep -q "avx2" /proc/cpuinfo 2>/dev/null && grep -q "bmi2" /proc/cpuinfo 2>/dev/null && echo "x86_64-v3" || echo "x86_64" ;; aarch64|arm64) echo "aarch64" ;; *) echo ""; return 1 ;; esac
+}
+detect_libc() {
+  for f in /lib/ld-musl-*.so.* /lib64/ld-musl-*.so.*; do [[ -e "$f" ]] && { echo "musl"; return 0; }; done
+  grep -qE '^ID="?alpine"?' /etc/os-release 2>/dev/null && { echo "musl"; return 0; }
+  ldd --version 2>&1 | grep -qi musl && { echo "musl"; return 0; }
+  echo "gnu"
+}
+if systemctl is-active --quiet telemt 2>/dev/null; then
+  CURRENT=$(curl -s --max-time 5 "http://127.0.0.1:9091/v1/system/info" | jq -r '.data.version // ""')
+  LATEST=$(curl -s --max-time 10 "https://api.github.com/repos/telemt/telemt/releases/latest" | jq -r '.tag_name // ""')
+  [[ "$(norm_ver "$CURRENT")" != "$(norm_ver "$LATEST")" && -n "$LATEST" ]] && {
+    ARCH=$(detect_arch); LIBC=$(detect_libc)
+    URL="https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH}-linux-${LIBC}.tar.gz"
+    TMP=$(mktemp -d)
+    curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz" || { [[ "$ARCH" == "x86_64-v3" ]] && { URL="https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-${LIBC}.tar.gz"; curl -fsSL "$URL" -o "${TMP}/telemt.tar.gz"; }; }
+    tar -xzf "${TMP}/telemt.tar.gz" -C "$TMP" 2>/dev/null
+    BIN=$(find "$TMP" -type f -name "telemt" -print 2>/dev/null | head -1)
+    [[ -n "$BIN" ]] && { systemctl stop telemt; install -m 0755 "$BIN" /usr/local/bin/telemt; setcap cap_net_bind_service,cap_net_admin=+ep /usr/local/bin/telemt 2>/dev/null; systemctl start telemt; sleep 3; systemctl is-active --quiet telemt && log "Telemt обновлён до $LATEST" || log "Ошибка: сервис не запустился после обновления"; }
+    rm -rf "$TMP"
+  }
+fi
+AUSH
+      chmod +x /usr/local/bin/telemt-autoupdate.sh
+      (crontab -l 2>/dev/null | grep -v "telemt-autoupdate"; echo "0 */3 * * * /usr/local/bin/telemt-autoupdate.sh") | crontab -
+      ok "Автообновление включено (каждые 3 часа)"
+      ;;
+    2) crontab -l 2>/dev/null | grep -v "telemt-autoupdate" | crontab - 2>/dev/null; rm -f /usr/local/bin/telemt-autoupdate.sh /var/lock/telemt-autoupdate.lock; ok "Автообновление выключено" ;;
+    3) echo -e "${C}=== Лог автообновлений ===${N}"; cat /var/log/telemt-autoupdate.log 2>/dev/null || info "Лог пуст" ;;
+  esac
+  read -rp "Enter..."
+}
+
+do_telemt_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "⚡ Telemt — MTProto прокси (TLS-камуфляж)"
+    echo ""
+    local is_active=false
+    systemctl is-active --quiet telemt 2>/dev/null && is_active=true
+    if $is_active; then
+      echo -e "  Статус: ${G}● запущен${N}"
+      local port=$(grep -oP 'port = \K\d+' /etc/telemt/telemt.toml 2>/dev/null || echo "?")
+      local domain=$(grep -oP 'tls_domain = "\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null || echo "?")
+      echo -e "  Порт: ${W}$port${N}  |  TLS: ${W}$domain${N}"
+    else
+      echo -e "  Статус: ${D}○ не установлен${N}"
+    fi
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Установка"
+    echo -e "  2) Ссылки / статистика"
+    echo -e "  3) Добавить клиента"
+    echo -e "  4) Удалить клиента"
+    echo -e "  5) Обновить Telemt"
+    echo -e "  6) Полное удаление"
+    echo -e "  ${C}10)${N} Автообновление"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    TELEMT_CHOICE=0; safe_read TELEMT_CHOICE "$(echo -e "${C}  Выбор [0-10]: ${N}")"
+    case "${TELEMT_CHOICE:-}" in
+      1)  do_telemt_install ;;
+      2)  do_telemt_links ;;
+      3)  do_telemt_add_client ;;
+      4)  do_telemt_del_client ;;
+      5)  do_telemt_update ;;
+      6)  do_telemt_remove ;;
+      10) do_telemt_autoupdate ;;
+      0)  break ;;
+      *)  warn "Неверный выбор" ;;
+    esac
+  done
+  set -e
+}
+
 trap '_global_cleanup' EXIT
 trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
 
@@ -6899,6 +7316,7 @@ while true; do
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
     17)  do_xray_menu ;;
+    18)  do_telemt_menu ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
@@ -6916,7 +7334,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 16 ]]; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 18 ]]; then
     ERROR_COUNT=0
   fi
 
