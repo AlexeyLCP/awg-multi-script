@@ -2,7 +2,7 @@
 set -euo pipefail
 
 VERSION="v6.8.5"
-UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
+UPDATE_URL="https://raw.githubusercontent.com/alexeylcp/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Цвета ──────────────────────────────────────────────────
