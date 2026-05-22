@@ -3,18 +3,48 @@
 # **AWG Toolza**
 
 **Менеджер AmneziaWG 2.0** — VPN с DPI-обходом одной командой.<br>
-3 уровня обфускации, 5 профилей мимикрии, локальный CPS-генератор, **Warp туннель Cloudflare**, DPI-тест.
+3 уровня обфускации, 5 профилей мимикрии, локальный CPS-генератор, **Warp туннель Cloudflare**, **Xray туннель (VLESS/VMess)**, DPI-тест.
 
 <br>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.7.5-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.8.5-ff6b00?style=flat-square)](#)
 
 <br>
 
 </div>
+
+---
+
+## 🚀 Xray туннель — главное отличие от форка
+
+Проброс трафика AWG-клиентов через Xray (VLESS/VMess + REALITY/xHTTP). Когда TSPU режет и AmneziaWG, и Cloudflare — трафик маскируется под обычный HTTPS к Google/Drive.
+
+```
+Клиент → AWG → сервер → Xray (TUN/gvisor) → VLESS+REALITY → прокси → интернет
+                                           → VLESS+REALITY → прокси → интернет  (балансировка)
+```
+
+**Возможности (пункт 17):**
+- **TUN-вход Xray** — встроенный gvisor-стек, без tun2proxy
+- **Балансировка** — несколько VLESS/VMess outbounds, `random` balancer
+- **Selective routing** — выбор клиентов, которые ходят через Xray
+- **Авто-миграция** — обновление конфига Xray при запуске
+
+**Меню Xray (пункт 17):**
+```
+1) Установить Xray
+2) Добавить outbound (vless:// или vmess://)
+3) Удалить outbound
+4) Балансировщик (random по всем proxy)
+5) Включить туннель
+6) Выключить туннель
+7) Управление клиентами в Xray
+```
+
+Xray и Warp **не могут работать одновременно** — выбери что-то одно.
 
 ---
 
@@ -70,9 +100,9 @@ d) Удалить Warp полностью
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7.5                         ║
+║    AWG Toolza v6.8.5                         ║
 ║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
-║              + Warp туннель Cloudflare       ║
+║          + Warp / Xray туннели      ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 100.20.38.41
   Порт       : 41300
@@ -108,6 +138,9 @@ d) Удалить Warp полностью
 
   ▸ Шифрованный DNS:
   16) DNS-шифрование  ● включено / ○ выключено / ○ не настроен
+
+  ▸ Xray туннель:
+  17) Xray туннель  ● включен / ○ настроен, выключен / ○ не настроен
 
    0) Выход
 ```
@@ -225,14 +258,6 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 ---
 
-## Новые возможности (Xray)
-
-Скрипт дополнен поддержкой туннеля через Xray:
-- Добавление внешних proxy (`vless://`, `vmess://`)
-- Поддержка балансировки трафика (`random` balancer) между несколькими proxy
-- Маршрутизация выбранных клиентов AWG в туннель Xray
-- Взаимоисключающая работа с туннелем Warp.
-
 ---
 
 <div align="center">
@@ -243,7 +268,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.7.5** · MIT License
+**AWG Toolza v6.8.5** · MIT License
 
 *Доработки от alexeylcp (в т.ч. интеграция Xray)* · **PolyForm Noncommercial 1.0.0**
 
