@@ -154,6 +154,11 @@ WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_TIMER="/etc/systemd/system/awg-warp-healthcheck.timer"
 WARP_HEALTH_SERVICE="/etc/systemd/system/awg-warp-healthcheck.service"
 
+XRAY_DIR="/etc/xray"
+XRAY_CONF="$XRAY_DIR/config.json"
+XRAY_STATE="$XRAY_DIR/state"
+XRAY_PEERS="$XRAY_DIR/peers.list"
+
 # Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
 # Шифрованный DNS (dnscrypt-proxy) — пункт меню 16
 # Используем системный сокет Debian/Ubuntu: 127.0.2.1:53 (socket activation)
@@ -748,6 +753,18 @@ choose_mimicry_profile() {
   if [[ "${OBF_LEVEL:-1}" == "1" ]]; then
     MIMICRY_PROFILE="none"
     return 0
+  fi
+
+  echo ""
+
+  # === XRAY ТУННЕЛЬ ===
+  echo -e "  ${C}▸ Xray туннель:${N}"
+  if ip link show xray0 &>/dev/null; then
+    echo -e "  ${C}17)${N} Xray туннель  ${G}● включен${N}"
+  elif [[ -f "$XRAY_CONF" ]]; then
+    echo -e "  ${C}17)${N} Xray туннель  ${D}○ настроен, выключен${N}"
+  else
+    echo -e "  ${C}17)${N} Xray туннель  ${D}○ не настроен${N}"
   fi
 
   echo ""
@@ -4114,6 +4131,12 @@ _warp_up() {
     return 0
   fi
 
+  if ip link show xray0 &>/dev/null; then
+    err "Туннель Xray активен! Xray и Warp не могут работать одновременно."
+    warn "Выключи Xray (пункт 17 -> 6), затем включай Warp."
+    return 1
+  fi
+
   # Получаем CLIENT_NET ДО поднятия интерфейса — без AWG нет смысла делать split-tunnel
   local client_net iface
   client_net=$(_warp_get_client_net 2>/dev/null || echo "")
@@ -6080,6 +6103,548 @@ AWG_VERSION="2.0"   # единственная поддерживаемая ве
 I1=""
 I2=""
 I3=""
+do_xray_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "☁  Xray туннель"
+    echo ""
+    _xray_status || true
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Установить Xray"
+    echo -e "  2) Добавить Outbound (ссылка)"
+    echo -e "  3) Удалить Outbound"
+    echo -e "  4) Настроить балансировщик"
+    echo -e "  5) Включить туннель"
+    echo -e "  6) Выключить туннель"
+    echo -e "  ${C}7) Управление клиентами в Xray${N}"
+    echo -e "  0) Назад в главное меню"
+    echo ""
+    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")"
+
+    case "${XRAY_CHOICE:-}" in
+      1) _xray_install; read -rp "Enter..." ;;
+      2) _xray_add_outbound; read -rp "Enter..." ;;
+      3) _xray_remove_outbound; read -rp "Enter..." ;;
+      4) _xray_setup_balancer; read -rp "Enter..." ;;
+      5) _xray_up; read -rp "Enter..." ;;
+      6) _xray_down; read -rp "Enter..." ;;
+      7) do_xray_peers_menu ;;
+      0) break ;;
+      *) warn "Неверный выбор" ;;
+    esac
+  done
+  set -e
+}
+
+_xray_status() {
+  if ip link show xray0 &>/dev/null; then
+    echo -e "  Интерфейс  : ${G}● xray0 активен${N}"
+  else
+    echo -e "  Интерфейс  : ${D}○ xray0 выключен${N}"
+  fi
+}
+
+_xray_install() {
+  if command -v xray &>/dev/null; then
+    warn "Xray уже установлен ($(xray version | head -n1))"
+    return 0
+  fi
+  info "Скачиваем Xray..."
+  local zip_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+  wget -qO /tmp/xray.zip "$zip_url" || { err "Ошибка скачивания Xray"; return 1; }
+  info "Распаковка Xray..."
+  unzip -qo /tmp/xray.zip xray geoip.dat geosite.dat -d /usr/local/bin/ || { err "Ошибка распаковки Xray"; return 1; }
+  chmod +x /usr/local/bin/xray
+  rm -f /tmp/xray.zip
+
+  mkdir -p "$XRAY_DIR"
+  cat > "$XRAY_CONF" << 'JSONEOF'
+{
+  "inbounds": [
+    {
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "protocol": "tun",
+      "tag": "xray0",
+      "settings": {
+        "name": "xray0",
+        "ips": ["172.16.250.2/30"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["xray0"],
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+}
+JSONEOF
+  ok "Xray успешно установлен. Конфиг: $XRAY_CONF"
+}
+
+_xray_add_outbound() {
+  safe_read link "Введите ссылку на Xray outbound (vless://... или vmess://...): "
+  if [[ -z "$link" ]]; then
+    warn "Ссылка пустая"
+    return 1
+  fi
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен. Сначала выполни установку (пункт 1)."
+    return 1
+  fi
+
+  info "Парсинг ссылки..."
+  local parser_script="/tmp/parse_xray_link.py"
+  cat > "$parser_script" << 'PYEOF'
+import sys
+import json
+import urllib.parse
+import base64
+
+def parse_link(link):
+    if link.startswith('vless://'):
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        outbound = {
+            "protocol": "vless",
+            "tag": "proxy_" + parsed.hostname.replace('.','_'),
+            "settings": {
+                "vnext": [{
+                    "address": parsed.hostname,
+                    "port": parsed.port or 443,
+                    "users": [{"id": parsed.username, "encryption": qs.get("encryption", ["none"])[0], "flow": qs.get("flow", [""])[0]}]
+                }]
+            },
+            "streamSettings": {
+                "network": qs.get("type", ["tcp"])[0],
+                "security": qs.get("security", ["none"])[0]
+            }
+        }
+        if outbound["streamSettings"]["security"] == "tls" or outbound["streamSettings"]["security"] == "reality":
+            tls_settings = {"serverName": qs.get("sni", [""])[0], "fingerprint": qs.get("fp", ["chrome"])[0]}
+            if "pbk" in qs:
+                tls_settings["publicKey"] = qs.get("pbk", [""])[0]
+            if "sid" in qs:
+                tls_settings["shortId"] = qs.get("sid", [""])[0]
+            if outbound["streamSettings"]["security"] == "reality":
+                outbound["streamSettings"]["realitySettings"] = tls_settings
+            else:
+                outbound["streamSettings"]["tlsSettings"] = tls_settings
+
+        print(json.dumps(outbound))
+
+    elif link.startswith('vmess://'):
+        b64 = link[8:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        data = json.loads(base64.b64decode(b64).decode('utf-8'))
+        outbound = {
+            "protocol": "vmess",
+            "tag": "proxy_" + data.get("add", "unknown").replace('.','_'),
+            "settings": {
+                "vnext": [{
+                    "address": data.get("add"),
+                    "port": int(data.get("port")),
+                    "users": [{"id": data.get("id"), "alterId": int(data.get("aid", 0))}]
+                }]
+            },
+            "streamSettings": {
+                "network": data.get("net", "tcp"),
+                "security": data.get("tls", "none")
+            }
+        }
+        if outbound["streamSettings"]["security"] == "tls":
+             outbound["streamSettings"]["tlsSettings"] = {"serverName": data.get("sni", "")}
+        print(json.dumps(outbound))
+    else:
+        print("Unsupported", file=sys.stderr)
+        sys.exit(1)
+
+try:
+    parse_link(sys.argv[1])
+except Exception as e:
+    print("Error:", e, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+  local new_outbound
+  new_outbound=$(python3 "$parser_script" "$link")
+  if [[ $? -ne 0 || -z "$new_outbound" ]]; then
+    err "Не удалось распарсить ссылку"
+    return 1
+  fi
+
+  local tag
+  tag=$(echo "$new_outbound" | grep -oP '"tag": "\K[^"]+')
+
+  info "Добавляем outbound '$tag' в $XRAY_CONF..."
+  # Simple python script to append outbound to config.json
+  local inject_script="/tmp/inject_xray.py"
+  cat > "$inject_script" << 'PYEOF2'
+import json
+import sys
+
+conf_path = sys.argv[1]
+new_out = json.loads(sys.argv[2])
+
+with open(conf_path, 'r') as f:
+    conf = json.load(f)
+
+# Insert before direct/freedom outbounds, or append
+inserted = False
+for i, out in enumerate(conf.get("outbounds", [])):
+    if out.get("protocol") == "freedom":
+        conf["outbounds"].insert(i, new_out)
+        inserted = True
+        break
+if not inserted:
+    conf.setdefault("outbounds", []).append(new_out)
+
+# Update routing to proxy traffic to newly added proxy
+proxy_rule = next((r for r in conf.get('routing', {}).get('rules', []) if r.get('outboundTag') and not r.get('outboundTag') == 'direct' or r.get('balancerTag') == 'balancer'), None)
+if proxy_rule:
+    # Set outboundTag directly to new outbound instead of abstract proxy (unless balancer is active)
+    if 'balancerTag' not in proxy_rule:
+        proxy_rule['outboundTag'] = new_out['tag']
+
+with open(conf_path, 'w') as f:
+    json.dump(conf, f, indent=2)
+PYEOF2
+
+  python3 "$inject_script" "$XRAY_CONF" "$new_outbound"
+  if [[ $? -eq 0 ]]; then
+    ok "Outbound '$tag' добавлен."
+  else
+    err "Ошибка добавления outbound"
+  fi
+}
+
+_xray_remove_outbound() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен"
+    return 1
+  fi
+  local tags
+  tags=$(python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); print('\n'.join([o.get('tag', 'unknown') for o in conf.get('outbounds', []) if o.get('tag') and not o.get('tag').startswith('direct')]))")
+
+  if [[ -z "$tags" ]]; then
+    warn "Нет настроенных proxy outbounds."
+    return 0
+  fi
+
+  echo -e "${C}Доступные outbounds:${N}"
+  local i=1
+  local arr=()
+  for t in $tags; do
+    echo -e "  ${C}$i)${N} $t"
+    arr+=("$t")
+    ((i++))
+  done
+  echo -e "  0) Отмена"
+
+  safe_read opt "Выберите номер для удаления: "
+  if [[ "$opt" == "0" || -z "$opt" || ! "$opt" =~ ^[0-9]+$ || "$opt" -gt "${#arr[@]}" ]]; then
+    return 0
+  fi
+
+  local target="${arr[$((opt-1))]}"
+  info "Удаляем '$target'..."
+  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != '$target']; json.dump(conf, open('$XRAY_CONF','w'), indent=2)"
+  ok "Outbound '$target' удалён."
+}
+
+_xray_setup_balancer() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Xray не установлен"
+    return 1
+  fi
+
+  local tags
+  tags=$(python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); print('\n'.join([o.get('tag', 'unknown') for o in conf.get('outbounds', []) if o.get('tag') and not o.get('tag').startswith('direct')]))")
+
+  if [[ -z "$tags" ]]; then
+    warn "Нет настроенных proxy outbounds. Добавь хотя бы один."
+    return 0
+  fi
+
+  local count
+  count=$(echo "$tags" | wc -l)
+  if [[ "$count" -lt 2 ]]; then
+    warn "Нужно как минимум 2 outbound для балансировки."
+    return 0
+  fi
+
+  info "Настраиваем балансировщик (random) для следующих outbounds:"
+  echo "$tags" | sed 's/^/  - /'
+
+  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); tags='$tags'.strip().split('\n'); conf.setdefault('routing', {}); conf['routing']['balancers'] = [{'tag': 'balancer', 'selector': tags, 'strategy': {'type': 'random'}}]; rules=conf['routing'].get('rules', []); proxy_rule=next((r for r in rules if r.get('outboundTag') and not r.get('outboundTag') == 'direct' or r.get('balancerTag')=='balancer'), None); if proxy_rule: proxy_rule.pop('outboundTag', None); proxy_rule['balancerTag'] = 'balancer'; else: rules.append({'type': 'field', 'inboundTag': ['xray0'], 'balancerTag': 'balancer'}); conf['routing']['rules']=rules; json.dump(conf, open('$XRAY_CONF','w'), indent=2)"
+
+  if [[ $? -eq 0 ]]; then
+    ok "Балансировщик успешно настроен. Трафик будет распределяться между добавленными outbounds."
+  else
+    err "Ошибка настройки балансировщика."
+  fi
+}
+
+_xray_up() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Конфиг Xray не найден. Сначала выполни пункт 1"
+    return 1
+  fi
+
+  if ip link show xray0 &>/dev/null; then
+    info "xray0 уже активен"
+    return 0
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    err "Туннель Warp активен! Xray и Warp не могут работать одновременно."
+    warn "Выключи Warp (пункт 15 -> 4), затем включай Xray."
+    return 1
+  fi
+
+  local client_net iface
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "eth0")
+
+  if [[ -z "$client_net" ]]; then
+    err "AWG сервер не настроен"
+    return 1
+  fi
+
+  info "Запускаем Xray..."
+  ip tuntap add dev xray0 mode tun || true
+  ip addr add 172.16.250.1/30 dev xray0 || true
+  ip link set dev xray0 up || true
+
+  systemd-run --unit=awg-xray.service --remain-after-exit /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
+  sleep 1
+
+  if ! systemctl is-active --quiet awg-xray.service; then
+    err "Не удалось запустить Xray. Логи: journalctl -u awg-xray.service"
+    ip link delete xray0 2>/dev/null || true
+    return 1
+  fi
+
+  sysctl -w net.ipv4.conf.xray0.rp_filter=2 >/dev/null 2>&1 || true
+
+  # Настройка маршрутизации для клиентов, аналогично warp0
+  iptables -t nat -C POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE
+  iptables -C FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i awg0 -o xray0 -j ACCEPT
+  iptables -C FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i xray0 -o awg0 -j ACCEPT
+
+  ip route add default dev xray0 table 201 2>/dev/null || true
+
+  _xray_sync_peers 2>/dev/null || true
+  if [[ ! -s "$XRAY_PEERS" ]]; then
+    info "Список клиентов в Xray пуст — добавляем всех по умолчанию"
+    mkdir -p "$XRAY_DIR"
+    while IFS='|' read -r name ip; do
+      [[ -z "$ip" ]] && continue
+      echo "$ip" >> "$XRAY_PEERS"
+    done < <(_warp_list_awg_clients)
+  fi
+
+  _xray_apply_peer_rules
+  peer_count=$(wc -l < "$XRAY_PEERS" 2>/dev/null || echo 0)
+
+  echo "active" > "$XRAY_STATE"
+  echo "client_net=$client_net" >> "$XRAY_STATE"
+  echo "iface=$iface" >> "$XRAY_STATE"
+
+  ok "Xray активен: $peer_count клиент(ов) через Xray"
+}
+
+_xray_down() {
+  if [[ -f "$XRAY_STATE" ]]; then
+    client_net=$(grep "^client_net=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+    iface=$(grep "^iface=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
+    _xray_remove_peer_rules
+    if [[ -n "$client_net" ]]; then
+      iptables -t nat -D POSTROUTING -s "$client_net" -o xray0 -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o xray0 -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || true
+    fi
+    ip route del default dev xray0 table 201 2>/dev/null || true
+  fi
+
+  if systemctl is-active --quiet awg-xray.service; then
+    systemctl stop awg-xray.service >/dev/null 2>&1 || true
+    systemctl disable awg-xray.service >/dev/null 2>&1 || true
+    rm -f /run/systemd/system/awg-xray.service 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  if ip link show xray0 &>/dev/null; then
+    info "Удаляем xray0..."
+    ip link delete xray0 2>/dev/null || true
+  fi
+
+  rm -f "$XRAY_STATE" 2>/dev/null
+  ok "Xray выключен"
+}
+
+_xray_sync_peers() {
+  # Проверяем, есть ли удалённые клиенты, и чистим их из peers.list
+  if [[ -f "$XRAY_PEERS" ]]; then
+    local tmp_peers
+    tmp_peers=$(mktemp)
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      if _warp_list_awg_clients 2>/dev/null | grep -q "|$ip$"; then
+        echo "$ip" >> "$tmp_peers"
+      fi
+    done < "$XRAY_PEERS"
+    mv "$tmp_peers" "$XRAY_PEERS"
+  fi
+}
+
+_xray_peer_enabled() {
+  local ip="$1"
+  [[ -f "$XRAY_PEERS" ]] && grep -q "^${ip}$" "$XRAY_PEERS" 2>/dev/null
+}
+
+_xray_peer_add() {
+  local ip="$1"
+  _xray_peer_enabled "$ip" || echo "$ip" >> "$XRAY_PEERS"
+}
+
+_xray_peer_del() {
+  local ip="$1"
+  [[ -f "$XRAY_PEERS" ]] && sed -i "/^${ip}$/d" "$XRAY_PEERS"
+}
+
+_xray_apply_peer_rules() {
+  if [[ -s "$XRAY_PEERS" ]] && ip link show xray0 &>/dev/null; then
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      ip rule del from "$ip" lookup 201 2>/dev/null || true
+      ip rule add from "$ip" lookup 201
+    done < "$XRAY_PEERS"
+  fi
+}
+
+_xray_remove_peer_rules() {
+  if [[ -f "$XRAY_PEERS" ]]; then
+    while read -r ip; do
+      [[ -z "$ip" ]] && continue
+      ip rule del from "$ip" lookup 201 2>/dev/null || true
+    done < "$XRAY_PEERS"
+  fi
+}
+
+do_xray_peers_menu() {
+  set +e
+  while true; do
+    _xray_sync_peers 2>/dev/null || true
+    clear
+    echo ""
+    hdr "⚙ Клиенты в Xray туннеле"
+    echo ""
+
+    local clients=()
+    while IFS='|' read -r name ip; do
+      [[ -z "$name" || -z "$ip" ]] && continue
+      clients+=("$name|$ip")
+    done < <(_warp_list_awg_clients)
+
+    if [[ ${#clients[@]} -eq 0 ]]; then
+      warn "AWG клиентов нет — добавь через пункт 3"
+      read -rp "Enter..."
+      set -e
+      return 0
+    fi
+
+    local i=1
+    for entry in "${clients[@]}"; do
+      local name="${entry%|*}"
+      local ip="${entry##*|}"
+      if _xray_peer_enabled "$ip"; then
+        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}☁ через Xray${N}"
+      else
+        echo -e "  ${D}[$i]${N} $name  ${D}$ip${N}  ${D}○ напрямую${N}"
+      fi
+      ((i++))
+    done
+    echo ""
+    echo -e "  ${C}a) Включить всех${N}  |  ${D}d) Выключить всех${N}"
+    echo -e "  0) Назад"
+    echo ""
+
+    safe_read P_CHOICE "  Введи номер клиента (или a/d/0): "
+    case "${P_CHOICE:-}" in
+      0) break ;;
+      a|A)
+        for entry in "${clients[@]}"; do
+          _xray_peer_add "${entry##*|}"
+        done
+        _xray_apply_peer_rules
+        ok "Все клиенты направлены через Xray"
+        sleep 1
+        ;;
+      d|D)
+        _xray_remove_peer_rules
+        > "$XRAY_PEERS"
+        ok "Все клиенты идут напрямую (AWG -> eth0)"
+        sleep 1
+        ;;
+      *)
+        if [[ "$P_CHOICE" =~ ^[0-9]+$ ]] && (( P_CHOICE >= 1 && P_CHOICE <= ${#clients[@]} )); then
+          local idx=$((P_CHOICE - 1))
+          local entry="${clients[$idx]}"
+          local name="${entry%|*}"
+          local ip="${entry##*|}"
+          if _xray_peer_enabled "$ip"; then
+            _xray_peer_del "$ip"
+            if ip link show xray0 &>/dev/null; then
+              ip rule del from "$ip" lookup 201 2>/dev/null || true
+            fi
+            ok "$name → напрямую"
+          else
+            _xray_peer_add "$ip"
+            if ip link show xray0 &>/dev/null; then
+              ip rule del from "$ip" lookup 201 2>/dev/null || true
+              ip rule add from "$ip" lookup 201
+            fi
+            ok "$name → через Xray"
+          fi
+          sleep 1
+        else
+          warn "Неверный выбор"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+  set -e
+}
+
 I4=""
 I5=""
 MIMICRY_PROFILE=""
@@ -6136,6 +6701,7 @@ while true; do
     14)  do_self_update ;;
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
+    17)  do_xray_menu ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
