@@ -1678,7 +1678,7 @@ show_header() {
   fi
 
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${W}AwgToolza $VERSION${N}"
+  echo -e "  ${W}AWG Toolza: LucX Edition $VERSION${N}"
   echo -e "  ${C}TG: @awgToolza${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  IP сервера : ${W}$ip${N}"
@@ -7163,7 +7163,7 @@ if [[ -f "$LOG_FILE" ]]; then
   unset _log_size
 fi
 
-log_info "=== AWG Toolza ${VERSION} запущен ==="
+log_info "=== AWG Toolza: LucX Edition ${VERSION} запущен ==="
 
 # Trap EXIT/INT/TERM — cleanup временных файлов и кэшей
 # ═══════════════════════════════════════════════════════════════════

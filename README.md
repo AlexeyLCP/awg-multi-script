@@ -1,6 +1,6 @@
 <div align="center">
 
-# **AWG Toolza**
+# **AWG Toolza: LucX Edition**
 
 **Менеджер AmneziaWG 2.0** — VPN с DPI-обходом одной командой.<br>
 3 уровня обфускации, 5 профилей мимикрии, локальный CPS-генератор, **Warp туннель Cloudflare**, **Xray туннель (VLESS/VMess)**, DPI-тест.
@@ -100,7 +100,7 @@ d) Удалить Warp полностью
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.8.5                         ║
+║    AWG Toolza: LucX Edition v6.8.5            ║
 ║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
 ║          + Warp / Xray туннели      ║
 ╚══════════════════════════════════════════════╝
@@ -268,7 +268,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.8.5** · MIT License
+**AWG Toolza: LucX Edition v6.8.5** · MIT License
 
 *Доработки от alexeylcp (в т.ч. интеграция Xray)* · **PolyForm Noncommercial 1.0.0**
 
