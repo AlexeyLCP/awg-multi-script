@@ -6155,6 +6155,13 @@ _xray_install() {
   info "Скачиваем Xray..."
   local zip_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
   wget -qO /tmp/xray.zip "$zip_url" || { err "Ошибка скачивания Xray"; return 1; }
+
+  if ! command -v unzip &>/dev/null; then
+    info "Устанавливаем unzip..."
+    apt-get update >/dev/null 2>&1
+    apt-get install -y unzip >/dev/null 2>&1
+  fi
+
   info "Распаковка Xray..."
   unzip -qo /tmp/xray.zip xray geoip.dat geosite.dat -d /usr/local/bin/ || { err "Ошибка распаковки Xray"; return 1; }
   chmod +x /usr/local/bin/xray
@@ -6465,10 +6472,15 @@ _xray_up() {
   info "Запускаем tun2proxy для интеграции с Xray..."
   if ! command -v tun2proxy &>/dev/null; then
     info "Скачиваем tun2proxy..."
-    wget -qO /tmp/tun2proxy.tar.gz "https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-linux-amd64.tar.gz"
-    tar -xzf /tmp/tun2proxy.tar.gz -C /usr/local/bin/ tun2proxy
+    if ! command -v unzip &>/dev/null; then
+      apt-get update >/dev/null 2>&1
+      apt-get install -y unzip >/dev/null 2>&1
+    fi
+    wget -qO /tmp/tun2proxy.zip "https://github.com/tun2proxy/tun2proxy/releases/latest/download/tun2proxy-x86_64-unknown-linux-musl.zip"
+    unzip -qo /tmp/tun2proxy.zip tun2proxy-x86_64-unknown-linux-musl -d /tmp/
+    mv /tmp/tun2proxy-x86_64-unknown-linux-musl /usr/local/bin/tun2proxy
     chmod +x /usr/local/bin/tun2proxy
-    rm -f /tmp/tun2proxy.tar.gz
+    rm -f /tmp/tun2proxy.zip
   fi
 
   ip tuntap add dev xray0 mode tun || true
