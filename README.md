@@ -14,9 +14,6 @@
 
 <br>
 
-[![Boosty](https://img.shields.io/badge/Boosty-Поддержать-F15F2C?style=for-the-badge&logo=boost&logoColor=white)](https://boosty.to/awgtoolza/donate)
-[![YooMoney](https://img.shields.io/badge/YooMoney-Поддержать-8B3FFC?style=for-the-badge&logo=yandex&logoColor=white)](https://yoomoney.ru/to/4100119521619579)
-
 </div>
 
 ---
@@ -24,7 +21,7 @@
 ## Быстрый старт
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
+sudo curl -fsSL https://raw.githubusercontent.com/alexeylcp/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
 ```
 
 Запуск в любой момент:
@@ -155,7 +152,7 @@ d) Удалить Warp полностью
 **Установка:**
 
 ```bash
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/alexeylcp/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
 ```
 
 **Запуск:**
@@ -216,7 +213,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 ## Проверка конфига
 
-Проверить свой `.conf` на валидность, DPI-стойкость и оптимальность параметров можно через [AWG Analyzer](https://pumbax.github.io/awg-analyzer/) — полностью локальный JS-инструмент:
+Проверить свой `.conf` на валидность, DPI-стойкость и оптимальность параметров можно через [AWG Analyzer](https://alexeylcp.github.io/awg-analyzer/) — полностью локальный JS-инструмент:
 
 - Детект версии (WireGuard / AWG 1.0 / 1.5 / 2.0) + уровень обфускации
 - Глубокий разбор I1-I5 (валидность `<b 0x...>`, лимит `<r>`, протокол)
@@ -228,18 +225,13 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 ---
 
-## Поддержать
+## Новые возможности (Xray)
 
-**Boosty:** https://boosty.to/awgtoolza/donate
-
-**YooMoney:** https://yoomoney.ru/to/4100119521619579
-
-| Сеть | Адрес |
-|---|---|
-| USDT TRC20 | `TN2rQAsGNHQr8wnneKRD14UMX629D2Ca5q` |
-| USDT ERC20 | `0x721845234eeC44e0a9BaE78402965828C1bc6c57` |
-| USDT TON | `UQCwj-RY2a4BH7sIDDeLb77XRaPDq0mb1FVwyC4UaOGbLMYy` |
-| TON | `UQCdQtJO4CF0Lyeb93X2zdeWeAcDJ-ieBC3AaL7LIqWfMBg3` |
+Скрипт дополнен поддержкой туннеля через Xray:
+- Добавление внешних proxy (`vless://`, `vmess://`)
+- Поддержка балансировки трафика (`random` balancer) между несколькими proxy
+- Маршрутизация выбранных клиентов AWG в туннель Xray
+- Взаимоисключающая работа с туннелем Warp.
 
 ---
 
@@ -252,5 +244,7 @@ sudo journalctl -u awg-bot -f       # живые логи
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
 **AWG Toolza v6.7.5** · MIT License
+
+*Доработки от alexeylcp (в т.ч. интеграция Xray)* · **PolyForm Noncommercial 1.0.0**
 
 </div>
