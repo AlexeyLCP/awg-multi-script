@@ -6238,7 +6238,7 @@ JSONEOF
 }
 
 _xray_add_outbound() {
-  safe_read link "Введите ссылку на Xray outbound (vless://... или vmess://...): "
+  safe_read link "Введите ссылку на Xray outbound (vless:// / vmess:// / hysteria2://): "
   if [[ -z "$link" ]]; then
     warn "Ссылка пустая"
     return 1
@@ -6310,6 +6310,41 @@ def parse_link(link):
         if outbound["streamSettings"]["security"] == "tls":
              outbound["streamSettings"]["tlsSettings"] = {"serverName": data.get("sni", "")}
         print(json.dumps(outbound))
+
+    elif link.startswith('hysteria2://') or link.startswith('hy2://'):
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        host = parsed.hostname
+        port = parsed.port or 443
+        password = parsed.username or ""
+        tag_name = host.replace('.','_') if host else 'hysteria'
+
+        settings = {
+            "server": host,
+            "port": port,
+            "password": password
+        }
+        # serverName (SNI)
+        if "sni" in qs:
+            settings["serverName"] = qs["sni"][0]
+        # insecure
+        if "insecure" in qs:
+            settings["insecure"] = qs["insecure"][0] == "1"
+        # obfs (salamander)
+        if "obfs" in qs:
+            obfs_type = qs["obfs"][0]
+            obfs_cfg = {"type": obfs_type}
+            if "obfs-password" in qs:
+                obfs_cfg["password"] = qs["obfs-password"][0]
+            settings["obfs"] = obfs_cfg
+
+        outbound = {
+            "protocol": "hysteria2",
+            "tag": "proxy_" + tag_name,
+            "settings": settings
+        }
+        print(json.dumps(outbound))
+
     else:
         print("Unsupported", file=sys.stderr)
         sys.exit(1)

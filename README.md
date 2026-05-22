@@ -29,14 +29,14 @@
 
 **Возможности (пункт 17):**
 - **TUN-вход Xray** — встроенный gvisor-стек, без tun2proxy
-- **Балансировка** — несколько VLESS/VMess outbounds, `random` balancer
+- **Балансировка** — несколько VLESS/VMess/Hysteria2 outbounds, `random` balancer
 - **Selective routing** — выбор клиентов, которые ходят через Xray
 - **Авто-миграция** — обновление конфига Xray при запуске
 
 **Меню Xray (пункт 17):**
 ```
 1) Установить Xray
-2) Добавить outbound (vless:// или vmess://)
+2) Добавить outbound (vless:// / vmess:// / hysteria2://)
 3) Удалить outbound
 4) Балансировщик (random по всем proxy)
 5) Включить туннель
