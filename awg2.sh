@@ -1767,6 +1767,8 @@ show_menu() {
     echo -e "  ${C}16)${N} DNS-шифрование  ${D}○ не настроен${N}"
   fi
 
+  echo ""
+
   # === XRAY ТУННЕЛЬ ===
   echo -e "  ${C}▸ Xray туннель:${N}"
   if ip link show xray0 &>/dev/null; then
@@ -6523,6 +6525,7 @@ _xray_up() {
     iptables -A FORWARD -i xray0 -o awg0 -j ACCEPT
 
   ip route add default dev xray0 table 201 2>/dev/null || true
+  ip rule add from "$client_net" table 201 priority 201 2>/dev/null || true
 
   _xray_sync_peers 2>/dev/null || true
   if [[ ! -s "$XRAY_PEERS" ]]; then
@@ -6555,6 +6558,7 @@ _xray_down() {
       iptables -D FORWARD -i xray0 -o awg0 -j ACCEPT 2>/dev/null || true
     fi
     ip route del default dev xray0 table 201 2>/dev/null || true
+    ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
   fi
 
   if systemctl is-active --quiet awg-tun2proxy.service; then
