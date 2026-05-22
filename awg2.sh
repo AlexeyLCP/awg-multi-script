@@ -7180,8 +7180,10 @@ do_telemt_remove() {
   rm -rf /etc/telemt /opt/telemt /usr/local/bin/telemt
   id telemt &>/dev/null && userdel telemt 2>/dev/null || true
   getent group telemt &>/dev/null && groupdel telemt 2>/dev/null || true
+  _telemt_remove_route 2>/dev/null || true
   crontab -l 2>/dev/null | grep -v "telemt-autoupdate" | crontab - 2>/dev/null || true
   rm -f /usr/local/bin/telemt-autoupdate.sh /var/lock/telemt-autoupdate.lock
+  rm -f "$TELEMT_ROUTE"
   systemctl daemon-reload
   ok "Telemt полностью удалён."
   read -rp "Enter..."
@@ -7245,6 +7247,51 @@ AUSH
   read -rp "Enter..."
 }
 
+# ── Telemt routing (UID-based policy routing) ──
+
+TELEMT_ROUTE="/etc/telemt/route"
+
+_telemt_get_route() {
+  if [[ -f "$TELEMT_ROUTE" ]]; then cat "$TELEMT_ROUTE"; else echo "direct"; fi
+}
+
+_telemt_remove_route() {
+  local uid=$(id -u telemt 2>/dev/null || echo "")
+  [[ -z "$uid" ]] && return
+  ip rule del uidrange "$uid-$uid" table 200 2>/dev/null || true
+  ip rule del uidrange "$uid-$uid" table 201 2>/dev/null || true
+}
+
+_telemt_apply_route() {
+  local uid=$(id -u telemt 2>/dev/null || echo "") route="$1"
+  [[ -z "$uid" ]] && return 1
+  _telemt_remove_route
+  case "$route" in
+    warp)
+      if ! ip link show warp0 &>/dev/null; then
+        warn "Warp не активен. Включи Warp (пункт 15 → 3), затем примени маршрут."
+        return 1
+      fi
+      ip rule add uidrange "$uid-$uid" table 200
+      ;;
+    xray)
+      if ! ip link show xray0 &>/dev/null; then
+        warn "Xray не активен. Включи Xray (пункт 17 → 5), затем примени маршрут."
+        return 1
+      fi
+      ip rule add uidrange "$uid-$uid" table 201
+      ;;
+  esac
+  return 0
+}
+
+_telemt_set_route() {
+  local route="$1"
+  mkdir -p "$(dirname "$TELEMT_ROUTE")"
+  echo "$route" > "$TELEMT_ROUTE"
+  _telemt_apply_route "$route"
+}
+
 do_telemt_menu() {
   set +e
   while true; do
@@ -7252,13 +7299,22 @@ do_telemt_menu() {
     echo ""
     hdr "⚡ Telemt — MTProto прокси (TLS-камуфляж)"
     echo ""
-    local is_active=false
+    local is_active=false route="direct" has_warp=false has_xray=false
     systemctl is-active --quiet telemt 2>/dev/null && is_active=true
+    route=$(_telemt_get_route)
+    ip link show warp0 &>/dev/null && has_warp=true
+    ip link show xray0 &>/dev/null && has_xray=true
+
     if $is_active; then
       echo -e "  Статус: ${G}● запущен${N}"
       local port=$(grep -oP 'port = \K\d+' /etc/telemt/telemt.toml 2>/dev/null || echo "?")
       local domain=$(grep -oP 'tls_domain = "\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null || echo "?")
       echo -e "  Порт: ${W}$port${N}  |  TLS: ${W}$domain${N}"
+      case "$route" in
+        direct) echo -e "  Исходящий: ${D}○ Direct${N}" ;;
+        warp)   echo -e "  Исходящий: ${G}◉ Warp${N} (через Cloudflare)" ;;
+        xray)   echo -e "  Исходящий: ${G}◉ Xray${N} (через прокси)" ;;
+      esac
     else
       echo -e "  Статус: ${D}○ не установлен${N}"
     fi
@@ -7270,6 +7326,7 @@ do_telemt_menu() {
     echo -e "  4) Удалить клиента"
     echo -e "  5) Обновить Telemt"
     echo -e "  6) Полное удаление"
+    echo -e "  ${M}7)${N} Исходящий трафик (Direct / Warp / Xray)"
     echo -e "  ${C}10)${N} Автообновление"
     echo -e "  0) Назад в главное меню"
     echo ""
@@ -7281,6 +7338,38 @@ do_telemt_menu() {
       4)  do_telemt_del_client ;;
       5)  do_telemt_update ;;
       6)  do_telemt_remove ;;
+      7)
+        if ! $is_active; then err "Telemt не запущен."; read -rp "Enter..."; continue; fi
+        echo ""
+        echo -e "  ${C}Исходящий трафик Telemt → Telegram DCs:${N}"
+        echo ""
+        echo -e "  ${C}1)${N} Direct  — напрямую (по умолчанию)"
+        echo -e "  ${C}2)${N} Warp    — через Cloudflare"
+        if ! $has_warp; then echo -e "      ${R}Warp не активен (требуется пункт 15 → 3)${N}"; fi
+        echo -e "  ${C}3)${N} Xray    — через VLESS/VMess/Hysteria2"
+        if ! $has_xray; then echo -e "      ${R}Xray не активен (требуется пункт 17 → 5)${N}"; fi
+        echo ""
+        safe_read TELEMT_ROUTE_CHOICE "Выбери маршрут [1-3]: "
+        case "${TELEMT_ROUTE_CHOICE:-}" in
+          1) _telemt_set_route "direct"; ok "Telemt → Direct" ;;
+          2)
+            if ! $has_warp; then
+              err "Warp не активен! Включи Warp (пункт 15 → 3)."
+            else
+              _telemt_set_route "warp" && ok "Telemt → Warp (Cloudflare)"
+            fi
+            ;;
+          3)
+            if ! $has_xray; then
+              err "Xray не активен! Включи Xray (пункт 17 → 5)."
+            else
+              _telemt_set_route "xray" && ok "Telemt → Xray"
+            fi
+            ;;
+          *) warn "Неверный выбор" ;;
+        esac
+        read -rp "Enter..."
+        ;;
       10) do_telemt_autoupdate ;;
       0)  break ;;
       *)  warn "Неверный выбор" ;;
