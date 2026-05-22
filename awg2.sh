@@ -6591,7 +6591,6 @@ _xray_install() {
       "protocol": "tun",
       "tag": "tun-in",
       "settings": {
-        "interface_name": "xray0",
         "mtu": 1200,
         "stack": "system",
         "address": ["172.16.250.1/30"]
@@ -6892,7 +6891,6 @@ tun_in = {
     'protocol': 'tun',
     'tag': 'tun-in',
     'settings': {
-        'interface_name': 'xray0',
         'mtu': 1200,
         'stack': 'system',
         'address': ['172.16.250.1/30']
@@ -6916,7 +6914,7 @@ with open('$XRAY_CONF', 'w') as f:
 " && ok "Конфиг Xray обновлён (добавлен TUN-вход)" || { err "Ошибка миграции конфига"; return 1; }
   fi
 
-  # Запускаем Xray — он сам создаст TUN-интерфейс согласно конфигу
+  # Запускаем Xray — он сам создаст TUN-интерфейс
   systemd-run --unit=awg-xray.service /usr/local/bin/xray run -c "$XRAY_CONF" >/dev/null 2>&1
   sleep 2
 
@@ -6925,16 +6923,23 @@ with open('$XRAY_CONF', 'w') as f:
     return 1
   fi
 
-  # Ищем TUN-интерфейс, созданный Xray (ищем по адресу 172.16.250.1)
-  local tun_dev
-  tun_dev=$(ip -o addr show to 172.16.250.1 2>/dev/null | awk '{print $2}' || true)
-  if [[ -z "$tun_dev" ]]; then
-    err "Не удалось найти TUN-интерфейс Xray (ожидается адрес 172.16.250.1)"
-    err "Проверь конфиг Xray: cat $XRAY_CONF"
+  # Ждём появления TUN-интерфейса (Xray создаёт его асинхронно)
+  local tun_dev="xray0"
+  for i in $(seq 1 10); do
+    if ip link show "$tun_dev" &>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if ! ip link show "$tun_dev" &>/dev/null; then
+    err "TUN-интерфейс $tun_dev не появился после запуска Xray"
     systemctl stop awg-xray.service 2>/dev/null || true
     return 1
   fi
   info "TUN-интерфейс: $tun_dev"
+
+  # Назначаем IP вручную (Xray не всегда делает это сам)
+  ip addr add 172.16.250.1/30 dev "$tun_dev" 2>/dev/null || true
 
   sysctl -w net.ipv4.conf."$tun_dev".rp_filter=2 >/dev/null 2>&1 || true
 
