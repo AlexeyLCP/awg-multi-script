@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.8.7-lucx"
+VERSION="v6.8.8-lucx"
 UPDATE_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -1787,18 +1787,6 @@ show_menu() {
 
   echo ""
 
-  # === XRAY ТУННЕЛЬ ===
-  echo -e "  ${C}▸ Xray туннель:${N}"
-  if ip link show xray0 &>/dev/null; then
-    echo -e "  ${C}17)${N} Xray туннель  ${G}● включен${N}"
-  elif [[ -f "$XRAY_CONF" ]]; then
-    echo -e "  ${C}17)${N} Xray туннель  ${D}○ настроен, выключен${N}"
-  else
-    echo -e "  ${C}17)${N} Xray туннель  ${D}○ не настроен${N}"
-  fi
-
-  echo ""
-
   # === КАСКАД ===
   echo -e "  ${C}▸ Каскад (проброс на зарубежный VPS):${N}"
   local _casc_rules=0
@@ -1813,6 +1801,32 @@ show_menu() {
     echo -e "  ${C}17)${N} Каскад  ${Y}○ правила есть, persist выключен${N}"
   else
     echo -e "  ${C}17)${N} Каскад  ${D}○ не настроен${N}"
+  fi
+
+  echo ""
+
+  # === XRAY ТУННЕЛЬ ===
+  echo -e "  ${C}▸ Xray туннель:${N}"
+  if ip link show xray0 &>/dev/null; then
+    echo -e "  ${C}18)${N} Xray туннель  ${G}● включен${N}"
+  elif [[ -f "$XRAY_CONF" ]]; then
+    echo -e "  ${C}18)${N} Xray туннель  ${D}○ настроен, выключен${N}"
+  else
+    echo -e "  ${C}18)${N} Xray туннель  ${D}○ не настроен${N}"
+  fi
+
+  echo ""
+
+  # === TELEGRAM-БОТ ===
+  echo -e "  ${C}▸ Telegram-бот:${N}"
+  if [[ -f /usr/local/bin/awg-bot.py ]]; then
+    if systemctl is-active --quiet awg-bot 2>/dev/null; then
+      echo -e "  ${C}19)${N} Управление ботом  ${G}● запущен${N}"
+    else
+      echo -e "  ${C}19)${N} Управление ботом  ${D}○ установлен, выключен${N}"
+    fi
+  else
+    echo -e "  ${C}19)${N} Управление ботом  ${D}○ не установлен${N}"
   fi
 
   echo ""
@@ -9028,6 +9042,101 @@ _expire_ask_at_creation() {
   echo "$ts"
 }
 
+do_bot_menu() {
+  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+  local BOT_PY="/usr/local/bin/awg-bot.py"
+
+  while true; do
+    echo ""
+    hdr "🤖  Telegram-бот управления"
+    echo ""
+
+    local installed=false
+    [[ -f "$BOT_PY" ]] && installed=true
+
+    if $installed; then
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        echo -e "  Статус: ${G}● запущен${N}"
+      else
+        echo -e "  Статус: ${Y}○ установлен, остановлен${N}"
+      fi
+    else
+      echo -e "  Статус: ${D}○ не установлен${N}"
+    fi
+    echo ""
+
+    if $installed; then
+      echo -e "  ${C}1)${N} Переустановить / обновить бота"
+      echo -e "  ${G}2)${N} Запустить"
+      echo -e "  ${G}3)${N} Остановить"
+      echo -e "  ${G}4)${N} Перезапустить"
+      echo -e "  ${C}5)${N} Логи (последние 40 строк)"
+    else
+      echo -e "  ${C}1)${N} Установить бота"
+    fi
+    echo -e "  ${W}0)${N} Назад в главное меню"
+    echo ""
+
+    local _bc
+    safe_read _bc "$(echo -e "${C}  Выбор: ${N}")"
+
+    case "${_bc:-}" in
+      1)
+        if [[ $EUID -ne 0 ]]; then
+          err "Установка требует root. Запусти: ${W}sudo awg2${N}"
+        else
+          info "Скачиваю и запускаю установщик бота..."
+          # Качаем во временный файл и запускаем (как просил пользователь)
+          if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
+            bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
+            rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
+          else
+            err "Не удалось скачать установщик с GitHub"
+            info "Проверь интернет/доступ к raw.githubusercontent.com"
+          fi
+        fi
+        ;;
+      2)
+        if $installed; then
+          systemctl start awg-bot 2>/dev/null && ok "Запущен" || err "Не удалось запустить"
+        else
+          warn "Бот не установлен — сначала пункт 1"
+        fi
+        ;;
+      3)
+        if $installed; then
+          systemctl stop awg-bot 2>/dev/null && ok "Остановлен" || err "Не удалось остановить"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      4)
+        if $installed; then
+          systemctl restart awg-bot 2>/dev/null && ok "Перезапущен" || err "Не удалось перезапустить"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      5)
+        if $installed; then
+          echo ""
+          journalctl -u awg-bot -n 40 --no-pager 2>/dev/null || \
+            tail -n 40 /var/log/awg-bot.log 2>/dev/null || \
+            warn "Логи недоступны"
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      0) return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+
 _global_cleanup() {
   rm -rf /tmp/awg_tmp_* /tmp/awg_ping_* 2>/dev/null || true
   # Кэш доменов оставляем (используется повторно в do_check_domains),
@@ -9061,8 +9170,9 @@ while true; do
     14)  do_self_update ;;
     15)  do_warp_menu ;;
     16)  do_dns_menu ;;
-            17)  do_cascade_menu ;;
-            18)  do_xray_menu ;;
+    17)  do_cascade_menu ;;
+    18)  do_xray_menu ;;
+    19)  do_bot_menu ;;
     0)  log_info "Выход"
         echo -e "\n${G}  В путь! ${N}"
         echo -e "<< Подпишись на ТГ :) >>"
@@ -9080,7 +9190,7 @@ while true; do
       ;;
   esac
 
-  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 17 ]]; then
+  if [[ "${CHOICE:-}" =~ ^[0-9]+$ ]] && [[ "${CHOICE:-}" -le 18 ]]; then
     ERROR_COUNT=0
   fi
 
