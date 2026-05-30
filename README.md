@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.7.5-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.8.8-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -59,9 +59,7 @@ d) Удалить Warp полностью
 ```
 
 **Где взять Warp+ ключ:**
-- 🥇 **Cloudflare Zero Trust** на dash.cloudflare.com — безлимит до 50 устройств
 - 🥈 Приложение **1.1.1.1** → Аккаунт → Ключ
-- 🥉 Реферальная программа в 1.1.1.1 (до 25 ГБ, может уже не работать)
 
 **Если Warp не подключается на РФ хостинге:**
 1. `15 → 8` — импорт готового профиля через Google Cloud Shell
@@ -73,7 +71,7 @@ d) Удалить Warp полностью
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.7.5                         ║
+║    AWG Toolza v6.8.8                         ║
 ║   AWG 2.0 — QUIC / WebRTC / SIP / DNS        ║
 ║              + Warp туннель Cloudflare       ║
 ╚══════════════════════════════════════════════╝
@@ -112,6 +110,12 @@ d) Удалить Warp полностью
   ▸ Шифрованный DNS:
   16) DNS-шифрование  ● включено / ○ выключено / ○ не настроен
 
+  ▸ Каскад (проброс на зарубежный VPS):
+  17) Каскад  ● активен / ○ не настроен
+
+  ▸ Telegram-бот:
+  18) Управление ботом  ● запущен / ○ выключен / ○ не установлен
+
    0) Выход
 ```
 
@@ -146,13 +150,21 @@ d) Удалить Warp полностью
 Опционально — Telegram бот для управления сервером со смартфона. Добавляешь токен от @BotFather, и бот даёт inline-меню с теми же возможностями что и SSH.
 
 **Что умеет:**
-- Список клиентов со статусом (онлайн/offline, трафик, последний handshake)
+- Список клиентов со статусом (🟢/🟡/🔴/⚫ онлайн, трафик, последний handshake)
+- 🚨 **Сигнал при отвале клиента** — если онлайн-клиент пропадает из сети, бот шлёт уведомление со звуком (имя, IP, заметка, время пропажи). Чтобы не пропустить упавшее резервирование
 - Добавить клиента — выбор профиля мимикрии прямо в боте
 - Получить QR-код / текст / .conf файл по любому клиенту
+- 📝 Заметки к клиентам (произвольный текст, кликабельная ссылка если это URL)
+- ☁️ Вкл/выкл WARP для клиента прямо из карточки (синхронизировано с awg2)
+- ⏰ Срок действия клиента (auto-suspend по истечении)
 - Удалить клиента с подтверждением
 - Статус сервера (uptime AmneziaWG, количество подключений, нагрузка)
 
 **Установка:**
+
+Проще всего — через главное меню: `sudo awg2` → пункт **18) Управление ботом** → Установить.
+
+Или вручную:
 
 ```bash
 sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
@@ -168,6 +180,8 @@ sudo bash /tmp/awg-bot-install.sh
 2. **Telegram ID** — твой ID для авторизации (узнать через [@userinfobot](https://t.me/userinfobot))
 
 После установки бот стартует как systemd-сервис (`awg-bot.service`) и сам поднимается при перезагрузке.
+
+**Обновление:** пункт 18 → Обновить (или пункт 2 в меню установщика). Свежая версия тянется с GitHub автоматически, токен и chat_id сохраняются.
 
 **Команды бота:**
 - `/start` — главное меню (inline-кнопки)
@@ -193,6 +207,10 @@ sudo journalctl -u awg-bot -f       # живые логи
 | `/var/log/awg-Toolza.log` | Лог |
 | `~/awg_backup/` | Бекапы |
 | `/tmp/awg_domain_cache.txt` | Кэш проверки доменов (пункт 6) |
+| `/usr/local/bin/awg-bot.py` | Код Telegram-бота |
+| `/etc/awg-bot.conf` | Токен и chat_id бота |
+| `/etc/systemd/system/awg-bot.service` | Сервис бота |
+| `/var/log/awg-bot.log` | Лог бота |
 
 
 ---
@@ -251,6 +269,6 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.7.5** · MIT License
+**AWG Toolza v6.8.8** · MIT License
 
 </div>
