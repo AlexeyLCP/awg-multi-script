@@ -9043,7 +9043,7 @@ _expire_ask_at_creation() {
 }
 
 do_bot_menu() {
-  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+  local BOT_INSTALL_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg-bot-install.sh"
   local BOT_PY="/usr/local/bin/awg-bot.py"
 
   while true; do
