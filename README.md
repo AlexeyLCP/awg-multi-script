@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20only-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-6.9.3-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-6.9.0-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -73,9 +73,9 @@ d) Удалить Warp полностью
 
 ```
 ╔══════════════════════════════════════════════╗
-║    AWG Toolza v6.9.3                                 ║
-║   AWG 2.0 — TLS / DNS / SIP / QUIC мимикрия          ║
-║              + Warp туннель Cloudflare               ║
+║    AWG Toolza v6.9.0                         ║
+║   AWG 2.0 — TLS / DNS / SIP / QUIC мимик     ║
+║              + Warp туннель Cloudflare       ║
 ╚══════════════════════════════════════════════╝
   IP сервера : 100.20.38.41
   Порт       : 41300
@@ -299,6 +299,6 @@ sudo journalctl -u awg-bot -f       # живые логи
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v6.9.3** · MIT License
+**AWG Toolza v6.9.0** · MIT License
 
 </div>
