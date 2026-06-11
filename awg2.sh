@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.1"
+VERSION="v6.9.2"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -1647,11 +1647,6 @@ do_self_update() {
     cur_hash=$(sha256sum "$target" 2>/dev/null | cut -c1-12)
     new_hash=$(sha256sum "$tmp_file" 2>/dev/null | cut -c1-12)
     echo -e "  ${D}Хеши:    $cur_hash → $new_hash${N}"
-    if [[ "$cur_hash" == "$new_hash" ]]; then
-      info "Файлы идентичны (тот же hash) — обновление не требуется"
-      rm -f "$tmp_file"
-      return 0
-    fi
     echo ""
   fi
 
@@ -1681,6 +1676,14 @@ do_self_update() {
       return 0
     fi
   elif [[ "$new_num" -eq "$cur_num" ]]; then
+    # Версии равны. Если содержимое тоже идентично — обновление не нужно.
+    if cmp -s "$target" "$tmp_file"; then
+      ok "У тебя уже последняя версия ($VERSION) — обновление не требуется"
+      rm -f "$tmp_file"
+      echo ""
+      read -rp "$(echo -e "${D}  Нажми Enter для возврата в меню...${N}")" _ || true
+      return 0
+    fi
     info "Версия совпадает, но содержимое отличается (обновление через git без bump VERSION?)"
     local CONFIRM_FORCE
     read_yesno CONFIRM_FORCE "$(echo -e "${C}  Всё равно перезаписать? [y/N]: ${N}")" "n"
@@ -1845,11 +1848,11 @@ show_submenu_1() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_install ;;
-      2) do_gen ;;
-      3) do_restart ;;
-      4) do_repair ;;
-      5) do_reset_server ;;
+      1) do_install || true ;;
+      2) do_gen || true ;;
+      3) do_restart || true ;;
+      4) do_repair || true ;;
+      5) do_reset_server || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -1881,8 +1884,8 @@ show_submenu_2() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_manage_clients ;;
-      2) do_list_clients ;;
+      1) do_manage_clients || true ;;
+      2) do_list_clients || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -1910,8 +1913,8 @@ show_submenu_3() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_check_domains ;;
-      2) do_sniff_test ;;
+      1) do_check_domains || true ;;
+      2) do_sniff_test || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -1939,8 +1942,8 @@ show_submenu_4() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_backup ;;
-      2) do_restore ;;
+      1) do_backup || true ;;
+      2) do_restore || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -1993,9 +1996,9 @@ show_submenu_5() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_warp_menu ;;
-      2) do_dns_menu ;;
-      3) do_cascade_menu ;;
+      1) do_warp_menu || true ;;
+      2) do_dns_menu || true ;;
+      3) do_cascade_menu || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2119,8 +2122,8 @@ show_submenu_7() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_clean_clients ;;
-      2) do_uninstall ;;
+      1) do_clean_clients || true ;;
+      2) do_uninstall || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3046,14 +3049,14 @@ do_manage_clients() {
     local MGMT_CHOICE
     safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
     case "${MGMT_CHOICE:-}" in
-      1) do_add_client ;;
-      2) do_rename_client ;;
-      3) do_delete_client ;;
-      4) do_show_qr ;;
-      5) do_show_config ;;
-      6) do_bulk_add_clients ;;
-      7) do_expire_menu ;;
-      8) do_list_clients ;;
+      1) do_add_client || true ;;
+      2) do_rename_client || true ;;
+      3) do_delete_client || true ;;
+      4) do_show_qr || true ;;
+      5) do_show_config || true ;;
+      6) do_bulk_add_clients || true ;;
+      7) do_expire_menu || true ;;
+      8) do_list_clients || true ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3350,14 +3353,59 @@ do_add_client() {
     warn "Имя содержит недопустимые символы (только A-Z, a-z, 0-9, _, -) — возврат"
     return 0
   fi
+  # Запрет дублей: имя уже есть среди клиентов сервера (комментарий "# имя")
+  if grep -qx "# ${client_name}" "$SERVER_CONF" 2>/dev/null; then
+    warn "Клиент с именем '${client_name}' уже существует — выбери другое имя"
+    return 0
+  fi
 
   local client_file="/root/${client_name}_awg2.conf"
   if [[ -f "$client_file" ]]; then warn "Файл $client_file уже существует — будет перезаписан"; fi
 
   read_yesno CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")" "y"
   if [[ "$CONFIRM_IP" != "y" ]]; then
-    read -rp "  IP вручную (пример: ${base_ip}.5/32): " client_addr
-    [[ -z "$client_addr" ]] && { warn "IP не введён — возврат"; return 0; }
+    # Ручной ввод IP с валидацией формата, подсети, занятости и адреса сервера
+    local _srv_oct=""
+    local _srv_addr
+    _srv_addr=$(grep "^Address" "$SERVER_CONF" | awk -F"=" "{print \$2}" | tr -d " " | head -1 || true)
+    _srv_oct=$(echo "$_srv_addr" | cut -d/ -f1 | awk -F. "{print \$4}" || true)
+    local _manual=""
+    while true; do
+      read -rp "  IP вручную (пример: ${base_ip}.5/32): " _manual
+      [[ -z "$_manual" ]] && { warn "IP не введён — возврат"; return 0; }
+      # Дописываем /32 если пользователь ввёл без маски
+      [[ "$_manual" != */* ]] && _manual="${_manual}/32"
+      # Формат: X.X.X.X/32
+      if ! [[ "$_manual" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/32$ ]]; then
+        warn "Неверный формат. Нужно вида ${base_ip}.5/32 — попробуй ещё раз"
+        continue
+      fi
+      local _ip_only _o1 _o2 _o3 _o4
+      _ip_only="${_manual%/32}"
+      IFS=. read -r _o1 _o2 _o3 _o4 <<< "$_ip_only"
+      # Все октеты 0-255
+      if (( _o1>255 || _o2>255 || _o3>255 || _o4>255 )); then
+        warn "Октеты должны быть 0-255 — попробуй ещё раз"; continue
+      fi
+      # Должен попадать в подсеть base_ip (первые три октета)
+      if [[ "${_o1}.${_o2}.${_o3}" != "$base_ip" ]]; then
+        warn "IP вне подсети сервера (${base_ip}.x) — попробуй ещё раз"; continue
+      fi
+      # Не .0, не .1 (шлюз/сеть), не .255 (broadcast)
+      if (( _o4<2 || _o4>254 )); then
+        warn "Последний октет должен быть 2-254 — попробуй ещё раз"; continue
+      fi
+      # Не адрес сервера
+      if [[ -n "$_srv_oct" && "$_o4" == "$_srv_oct" ]]; then
+        warn "Этот IP занят сервером — попробуй другой"; continue
+      fi
+      # Не занят другим клиентом
+      if grep -qF "$_manual" "$SERVER_CONF" 2>/dev/null; then
+        warn "IP $_manual уже используется другим клиентом — попробуй другой"; continue
+      fi
+      client_addr="$_manual"
+      break
+    done
   fi
 
   choose_dns
@@ -5600,7 +5648,7 @@ do_warp_menu() {
         _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
         read -rp "Enter..."
         ;;
-      6) do_warp_peers_menu ;;
+      6) do_warp_peers_menu || true ;;
       7) _warp_health_toggle; read -rp "Enter..." ;;
       8) _warp_import_account; read -rp "Enter..." ;;
       9) _warp_endpoint_finder; read -rp "Enter..." ;;
@@ -7946,10 +7994,14 @@ notify_tg() {
   token=$(grep -E '^BOT_TOKEN=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
   chat_id=$(grep -E '^ADMIN_CHAT_ID=' "$BOT_CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
   [[ -z "$token" || -z "$chat_id" ]] && return 0
-  curl -sf --max-time 5 "https://api.telegram.org/bot${token}/sendMessage" \
-    -d "chat_id=${chat_id}" \
-    -d "parse_mode=HTML" \
-    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+  # Токен НЕ передаём в argv (иначе виден в `ps`/списке процессов).
+  # Отдаём url и data в curl через --config со stdin — argv остаётся чистым.
+  curl -sf --max-time 5 --config - >/dev/null 2>&1 <<CURLCFG || true
+url = "https://api.telegram.org/bot${token}/sendMessage"
+data = "chat_id=${chat_id}"
+data = "parse_mode=HTML"
+data-urlencode = "text=${text}"
+CURLCFG
 }
 
 # Питон делает всю работу: парсит, мутирует конфиг атомарно, syncconf, conntrack
@@ -8327,11 +8379,11 @@ do_expire_menu() {
     local EXP_CHOICE
     safe_read EXP_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
     case "${EXP_CHOICE:-}" in
-      1) _expire_action_set ;;
-      2) _expire_action_clear ;;
-      3) _expire_action_unban ;;
-      4) _expire_action_list ;;
-      5) _expire_action_purge ;;
+      1) _expire_action_set || true ;;
+      2) _expire_action_clear || true ;;
+      3) _expire_action_unban || true ;;
+      4) _expire_action_list || true ;;
+      5) _expire_action_purge || true ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -8636,13 +8688,13 @@ while true; do
 
   case "${CHOICE:-}" in
     1) show_submenu_1 ;;
-    2) do_manage_clients ;;
+    2) do_manage_clients || true ;;
     3) show_submenu_3 ;;
     4) show_submenu_4 ;;
     5) show_submenu_5 ;;
     6) show_submenu_6 ;;
     7) show_submenu_7 ;;
-    8) do_self_update ;;
+    8) do_self_update || true ;;
     0)
       log_info "Выход"
       echo -e "\n${G}  В путь! ${N}"
