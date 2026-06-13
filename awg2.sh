@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.2"
+VERSION="v6.9.3"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -436,35 +436,33 @@ select_random_domain() {
 }
 
 # Единый Python генератор для всех профилей мимикрии
+# [PATCHED v3] TLS+QUIC из payloadGen: GREASE, Chrome-fingerprint, реальное
+# шифрование QUIC (RFC9001+fallback), лёгкий TLS-паддинг (доставка I5),
+# --only-i1 распознаётся в любой позиции argv. Контракт вывода не изменён.
 _CPS_GENERATOR='
-import sys, secrets, struct, random
+import sys, secrets, struct, random, signal
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # чистое поведение при обрыве пайпа
+except Exception:
+    pass
 
-# ── Утилиты ────────────────────────────────────────────
+# == Utilities ==
 def rh(n):  return secrets.token_bytes(n)
-# Криптостойкий int [a..b] — заменяет random.randint для всех параметров
-# где предсказуемость нежелательна (pn_len, ports, expires и т.д.)
 def ri(a, b):
     if a > b: a, b = b, a
-    span = b - a + 1
-    return a + secrets.randbelow(span)
+    return a + secrets.randbelow(b - a + 1)
 def rc(lst): return lst[secrets.randbelow(len(lst))]
 def u16(v): return struct.pack(">H", v & 0xFFFF)
 def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def u24(v): return struct.pack(">I", v)[1:]
-def qv(v):
-    if v < 64:    return bytes([v])
-    elif v < 16384: return bytes([0x40|(v>>8)&0x3f, v&0xff])
-    else:         return bytes([0x80|(v>>24)&0x3f,(v>>16)&0xff,(v>>8)&0xff,v&0xff])
 def to_cps(raw): return "<b 0x%s>" % raw.hex()
 
-# Криптостойкий shuffle (Fisher-Yates) — заменяет random.shuffle
 def secure_shuffle(lst):
     for i in range(len(lst) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         lst[i], lst[j] = lst[j], lst[i]
     return lst
 
-# Случайный приватный IP — три варианта подсетей (10/8, 172.16/12, 192.168/16)
 def rand_private_ip():
     kind = secrets.randbelow(3)
     if kind == 0:
@@ -474,20 +472,29 @@ def rand_private_ip():
     else:
         return "192.168.%d.%d" % (ri(0, 255), ri(2, 254))
 
-# ── Аргументы ──────────────────────────────────────────
-# argv[1] = profile: quic|sip|dns
-# argv[2] = domain (опционально, иначе из пула)
-# argv[3] = --only-i1 (опционально) — генерировать только I1, без I2-I5
-ALLOWED_PROFILES = ("quic", "sip", "dns", "tls")
-PROFILE  = sys.argv[1] if len(sys.argv) > 1 else "dns"
-DOMAIN   = sys.argv[2] if len(sys.argv) > 2 else ""
-ONLY_I1  = len(sys.argv) > 3 and sys.argv[3] == "--only-i1"
+def _weighted_choice(items, weights):
+    total = sum(weights)
+    r = secrets.randbelow(total)
+    acc = 0
+    for item, w in zip(items, weights):
+        acc += w
+        if r < acc:
+            return item
+    return items[-1]
 
-# Валидация PROFILE — защита от опечатки в вызывающем коде.
-# При неизвестном профиле фоллбэк на "quic" + warn в stderr (не прерываем,
-# чтобы не сломать пайплайн, но даём диагностику).
+# == Args ==
+# profile = argv[1]; --only-i1 может прийти в любой позиции (Тулза шлёт argv[3],
+# бот шлёт argv[2] без domain). Domain = первый позиционный аргумент после
+# profile, который не является флагом --only-i1.
+ALLOWED_PROFILES = ("quic", "sip", "dns", "tls")
+_args = sys.argv[1:]
+ONLY_I1 = "--only-i1" in _args
+_pos = [a for a in _args if a != "--only-i1"]
+PROFILE = _pos[0] if len(_pos) > 0 else "dns"
+DOMAIN  = _pos[1] if len(_pos) > 1 else ""
+
 if PROFILE not in ALLOWED_PROFILES:
-    sys.stderr.write("[CPS] WARN: unknown profile \"%s\", fallback=dns\n" % PROFILE)
+    sys.stderr.write("[CPS] WARN: unknown profile %s, fallback=dns\n" % PROFILE)
     PROFILE = "dns"
 
 DOMAIN_POOL = [
@@ -506,115 +513,232 @@ SIP_POOL = [
     "sip.voys.nl","sip.antisip.com","sip.iptel.org","sip.voipgate.com",
 ]
 
-# ── Взвешенный выбор (криптостойкий) ───────────────────
-def _weighted_choice(items, weights):
-    total = sum(weights)
-    r = secrets.randbelow(total)
-    acc = 0
-    for item, w in zip(items, weights):
-        acc += w
-        if r < acc:
-            return item
-    return items[-1]
+# GREASE values (RFC 8701) - Chrome inserts these to keep middleboxes honest
+GREASE_VALUES = [
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
+    0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+]
+def grease(excluded=None):
+    pool = [v for v in GREASE_VALUES if v != excluded] or GREASE_VALUES
+    return rc(pool)
 
-# QUIC версии с весами (Chrome: v1 ~85%, v2 ~15%)
-_QUIC_VERSIONS    = [b"\x00\x00\x00\x01", b"\x6b\x33\x43\xcf"]
-_QUIC_VER_WEIGHTS = [85, 15]
+# ================================================================
+# TLS 1.3 ClientHello - Chrome-like fingerprint (ported from payloadGen)
+# Upgrades over the legacy engine: GREASE in ciphers + first/last ext,
+# full Chrome extension set in Chrome order, padding to 512B.
+# ================================================================
+def _ext(etype, data):
+    return u16(etype) + u16(len(data)) + data
 
-# ── I1: QUIC Long Header Initial, строго 1200 байт ─────
-# v1 (RFC 9000): fb=0xC0-0xC3; v2 (RFC 9369): fb=0xD0-0xD3
-# Chrome чаще шлёт v1, иногда v2; DCID=8B, SCID=8B, token=0
+def gen_tls_clienthello(domain=None):
+    host = (domain or DOMAIN).encode()
+    g1 = grease()
+    g2 = grease(g1)
+
+    # ClientHello ciphers: GREASE first, then Chrome real order
+    cipher_list = [0x1301,0x1302,0x1303,0xC02B,0xC02F,0xC02C,0xC030,
+                   0xCCA9,0xCCA8,0xC013,0xC014,0x009C,0x009D,0x002F,0x0035]
+    ciphers = u16(g1)
+    for c in cipher_list:
+        ciphers += u16(c)
+
+    # --- build extensions in Chrome order ---
+    exts = b""
+    # grease (empty)
+    exts += _ext(g1, b"")
+    # sni
+    sni_entry = b"\x00" + u16(len(host)) + host
+    exts += _ext(0x0000, u16(len(sni_entry)) + sni_entry)
+    # extended_master_secret (empty)
+    exts += _ext(0x0017, b"")
+    # renegotiation_info (1 byte len=0)
+    exts += _ext(0xff01, b"\x00")
+    # supported_groups: GREASE + x25519 + secp256r1 + secp384r1
+    groups = u16(grease()) + b"\x00\x1d" + b"\x00\x17" + b"\x00\x18"
+    exts += _ext(0x000a, u16(len(groups)) + groups)
+    # ec_point_formats: uncompressed
+    exts += _ext(0x000b, b"\x01\x00")
+    # session_ticket (empty)
+    exts += _ext(0x0023, b"")
+    # alpn: h2, http/1.1
+    alpn_protos = b"\x02h2\x08http/1.1"
+    exts += _ext(0x0010, u16(len(alpn_protos)) + alpn_protos)
+    # status_request: OCSP
+    exts += _ext(0x0005, b"\x01\x00\x00\x00\x00")
+    # signature_algorithms
+    sigs = b""
+    for s in [0x0403,0x0804,0x0401,0x0503,0x0805,0x0501,0x0806,0x0601]:
+        sigs += u16(s)
+    exts += _ext(0x000d, u16(len(sigs)) + sigs)
+    # signed_certificate_timestamp (empty)
+    exts += _ext(0x0012, b"")
+    # supported_versions: GREASE + TLS1.3 + TLS1.2
+    sv = u16(grease()) + b"\x03\x04" + b"\x03\x03"
+    exts += _ext(0x002b, bytes([len(sv)]) + sv)
+    # key_share: GREASE(empty) + x25519(32B)
+    gks = u16(grease()) + u16(0)
+    ks_entry = b"\x00\x1d" + u16(32) + rh(32)
+    ks_list = gks + ks_entry
+    exts += _ext(0x0033, u16(len(ks_list)) + ks_list)
+    # psk_key_exchange_modes: psk_dhe_ke
+    exts += _ext(0x002d, b"\x01\x01")
+    # compress_certificate: brotli
+    exts += _ext(0x001b, b"\x02\x00\x02")
+    # application_settings (ALPS): h2
+    alps = b"\x03\x02h2"
+    exts += _ext(0x4469, alps)
+    # secondary grease (empty)
+    exts += _ext(g2, b"")
+    # Light padding (like real Chrome): small random, NO fill to 512.
+    # Filling to 512 produced ~200 zero bytes per packet -> large I packets
+    # that mobile AWG does not always deliver (especially I5), plus the long
+    # zero tail is itself a signature. Chrome only pads slightly.
+    pad_len = ri(0, 48)
+    if pad_len > 0:
+        exts += _ext(0x0015, b"\x00" * pad_len)
+
+    legacy_version = b"\x03\x03"
+    random_bytes   = rh(32)
+    session_id     = rh(32)
+    sid            = bytes([len(session_id)]) + session_id
+    comp = b"\x01\x00"
+    body = legacy_version + random_bytes + sid + u16(len(ciphers)) + ciphers + comp + u16(len(exts)) + exts
+    hs   = b"\x01" + u24(len(body)) + body
+    rec  = b"\x16" + b"\x03\x01" + u16(len(hs)) + hs
+    return rec
+
+# ================================================================
+# QUIC Initial - ported from payloadGen (real CRYPTO frame + ClientHello)
+# Optional real encryption if the cryptography lib is present, else masked payload.
+# ================================================================
+_QUIC_VERSION = b"\x00\x00\x00\x01"  # QUIC v1 (RFC 9000)
+
+def _quic_varint(v):
+    if v < 64:
+        return bytes([v])
+    elif v < 16384:
+        return bytes([0x40 | ((v >> 8) & 0x3f), v & 0xff])
+    elif v < 1073741824:
+        return bytes([0x80 | ((v >> 24) & 0x3f), (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff])
+    else:
+        return bytes([0xc0 | ((v >> 56) & 0x3f)]) + struct.pack(">Q", v)[1:]
+
+def _quic_crypto_frame(ch):
+    # CRYPTO frame: type=0x06, offset=0, length, data
+    return b"\x06" + _quic_varint(0) + _quic_varint(len(ch)) + ch
+
+def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
+    # Real QUIC Initial protection (RFC 9001). Returns protected packet or None.
+    try:
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        import hmac as _hmac, hashlib as _hashlib
+    except Exception:
+        return None
+    try:
+        INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+        def hkdf_extract(salt, ikm):
+            return _hmac.new(salt, ikm, _hashlib.sha256).digest()
+        def hkdf_expand_label(secret, label, length):
+            full = b"tls13 " + label
+            info = u16(length) + bytes([len(full)]) + full + b"\x00"
+            hk = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info)
+            return hk.derive(secret)
+        initial_secret = hkdf_extract(INITIAL_SALT, dcid)
+        client_secret = hkdf_expand_label(initial_secret, b"client in", 32)
+        key = hkdf_expand_label(client_secret, b"quic key", 16)
+        iv  = hkdf_expand_label(client_secret, b"quic iv", 12)
+        hp  = hkdf_expand_label(client_secret, b"quic hp", 16)
+        # nonce = iv XOR pn (pn right-aligned)
+        pn_int = int.from_bytes(pn, "big")
+        nonce = bytearray(iv)
+        pn_bytes_full = pn_int.to_bytes(12, "big")
+        nonce = bytes(a ^ b for a, b in zip(nonce, pn_bytes_full))
+        aad = header_wo_pn + pn
+        ct = AESGCM(key).encrypt(nonce, payload, aad)
+        # header protection
+        sample = ct[4 - pn_len:4 - pn_len + 16]
+        enc = Cipher(algorithms.AES(hp), modes.ECB()).encryptor()
+        mask = enc.update(sample) + enc.finalize()
+        first = header_wo_pn[0] ^ (mask[0] & 0x0f)
+        prot_pn = bytes(pn[i] ^ mask[1 + i] for i in range(pn_len))
+        return bytes([first]) + header_wo_pn[1:] + prot_pn + ct
+    except Exception:
+        return None
+
 def gen_quic_initial(domain=None):
-    TARGET  = 1200
-    version = _weighted_choice(_QUIC_VERSIONS, _QUIC_VER_WEIGHTS)
-    if version == b"\x00\x00\x00\x01":
-        fb = rc([0xC0, 0xC0, 0xC0, 0xC3])   # v1: Initial type bits
+    TARGET = 1200
+    ch = gen_tls_clienthello(domain)        # reuse Chrome ClientHello as QUIC CRYPTO
+    crypto_frame = _quic_crypto_frame(ch)
+    dcid = rh(8)
+    scid = rh(8)
+    pn_len = 4
+    pn = rh(pn_len)
+    # header before length+pn:  first | ver | dcidlen | dcid | scidlen | scid | tokenlen
+    pre = bytes([0xC0 | (pn_len - 1)]) + _QUIC_VERSION + bytes([8]) + dcid + bytes([8]) + scid + b"\x00"
+    # pad CRYPTO frame with PADDING(0x00) to fill the 1200B datagram
+    overhead = len(pre) + 2 + pn_len + 16  # +2 varint length, +16 AEAD tag
+    pad = TARGET - overhead - len(crypto_frame)
+    payload = crypto_frame + (b"\x00" * pad if pad > 0 else b"")
+    length_field = pn_len + len(payload) + 16
+    header_wo_pn = pre + u16(0x4000 | length_field)
+    enc = _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload)
+    if enc is not None:
+        pkt = enc
     else:
-        fb = rc([0xD0, 0xD0, 0xD0, 0xD3])   # v2: Initial type bits (RFC 9369 §3.2)
-    pn_len   = (fb & 0x03) + 1
-    dcid     = rh(8)
-    scid     = rh(8)
-    # header = 1+4+1+8+1+8+1(tok)+2(varint plen) = 26
-    enc_size = TARGET - 26 - pn_len
-    if enc_size < 1:
-        enc_size = 1
-    plen_val  = pn_len + enc_size
-    pl_varint = u16(0x4000 | plen_val)
-    pn        = rh(pn_len)
-    # Payload: полностью случайный (имитация зашифрованного ClientHello)
-    payload   = rh(enc_size)
-    pkt = (bytes([fb]) + version +
-           bytes([8]) + dcid + bytes([8]) + scid +
-           b"\x00" + pl_varint + pn + payload)
-    if len(pkt) != TARGET:
-        pkt = pkt[:TARGET] if len(pkt) > TARGET else pkt + rh(TARGET - len(pkt))
-    return pkt
+        # masked fallback: plain header + pn + payload, random-padded to TARGET
+        pkt = header_wo_pn + pn + payload
+    if len(pkt) < TARGET:
+        pkt = pkt + rh(TARGET - len(pkt))
+    elif len(pkt) > TARGET:
+        pkt = pkt[:TARGET]
+    return pkt, dcid, _QUIC_VERSION
 
-# ── I2: второй QUIC Initial ─────────────────────────────
-# Chrome шлёт второй Initial меньшего размера (300-600B) с тем же DCID.
-# Это реалистичнее Short Header сразу после первого Initial.
-def gen_quic_second_initial(first_pkt):
-    version = first_pkt[1:5]   # та же версия что в I1
-    if version == b"\x00\x00\x00\x01":
-        fb = rc([0xC0, 0xC0, 0xC3])
-    else:
-        fb = rc([0xD0, 0xD0, 0xD3])
-    pn_len   = (fb & 0x03) + 1
-    dcid     = first_pkt[6:14]  # тот же DCID что в I1
-    scid     = rh(8)
-    TARGET2  = ri(300, 600)
+def gen_quic_second_initial(dcid, version):
+    fb = rc([0xC0, 0xC0, 0xC3])
+    pn_len = (fb & 0x03) + 1
+    scid = rh(8)
+    TARGET2 = ri(300, 600)
     enc_size = TARGET2 - 26 - pn_len
     if enc_size < 1:
         enc_size = 1
-    plen_val  = pn_len + enc_size
+    plen_val = pn_len + enc_size
     pl_varint = u16(0x4000 | plen_val)
-    pn        = rh(pn_len)
-    payload   = rh(enc_size)
-    pkt = (bytes([fb]) + version +
-           bytes([8]) + dcid + bytes([8]) + scid +
-           b"\x00" + pl_varint + pn + payload)
+    pn = rh(pn_len)
+    payload = rh(enc_size)
+    pkt = bytes([fb]) + version + bytes([8]) + dcid + bytes([8]) + scid + b"\x00" + pl_varint + pn + payload
     if len(pkt) != TARGET2:
         pkt = pkt[:TARGET2] if len(pkt) > TARGET2 else pkt + rh(TARGET2 - len(pkt))
     return pkt
 
-# ── I3-I5: QUIC Short Header (1-RTT) ───────────────────
-# Chrome после двух Initial шлёт 1-RTT: Short Header 0x40-0x7F.
-# Биты spin/key_phase/pn_len маскируются HP (RFC 9001 §5.4) —
-# для DPI они выглядят случайными, здесь тоже случайные.
 def gen_quic_short():
     pn_len = ri(1, 4)
-    spin   = ri(0, 1) << 5
-    key    = ri(0, 1) << 2
-    fb     = 0x40 | spin | key | (pn_len - 1)
-    dcid   = rh(8)
-    pn     = rh(pn_len)
-    data   = rh(ri(40, 90))
-    return bytes([fb]) + dcid + pn + data
+    spin = ri(0, 1) << 5
+    key  = ri(0, 1) << 2
+    fb   = 0x40 | spin | key | (pn_len - 1)
+    return bytes([fb]) + rh(8) + rh(pn_len) + rh(ri(40, 90))
 
-# ── SIP REGISTER ────────────────────────────────────────
-# Полный реалистичный набор заголовков как у Linphone / Zoiper / MicroSIP.
-# Минималистичный REGISTER без User-Agent/Allow/Supported характерен
-# для сканеров и легко детектится SIP-aware DPI.
+# ================================================================
+# SIP REGISTER (unchanged from legacy engine)
+# ================================================================
 SIP_UA_POOL = [
-    "Linphone/5.2.5 (belle-sip/5.2.0)",
-    "Zoiper rv2.10.20.4",
-    "MicroSIP/3.21.4",
-    "Bria 6.5.1",
-    "PortSIP UA 16.4",
+    "Linphone/5.2.5 (belle-sip/5.2.0)", "Zoiper rv2.10.20.4",
+    "MicroSIP/3.21.4", "Bria 6.5.1", "PortSIP UA 16.4",
 ]
 def gen_sip():
-    host   = rc(SIP_POOL)
-    user   = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
-    lip    = rand_private_ip()
-    lport  = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
+    host = rc(SIP_POOL)
+    user = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
+    lip = rand_private_ip()
+    lport = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
     branch = "z9hG4bK" + secrets.token_hex(7)
-    tag    = secrets.token_hex(4)
+    tag = secrets.token_hex(4)
     callid = "%s@%s" % (secrets.token_hex(8), host)
-    cseq   = ri(1, 50)
-    # transport чаще UDP (исторически), реже TCP/TLS
+    cseq = ri(1, 50)
     transport = rc(["udp","udp","udp","udp","tcp"])
-    user_agent = rc(SIP_UA_POOL)
-    lines  = [
+    ua = rc(SIP_UA_POOL)
+    lines = [
         "REGISTER sip:%s SIP/2.0" % host,
         "Via: SIP/2.0/%s %s:%d;branch=%s;rport" % (transport.upper(), lip, lport, branch),
         "Max-Forwards: 70",
@@ -623,107 +747,47 @@ def gen_sip():
         "Call-ID: %s" % callid,
         "CSeq: %d REGISTER" % cseq,
         "Contact: <sip:%s@%s:%d;transport=%s>" % (user, lip, lport, transport),
-        "User-Agent: %s" % user_agent,
+        "User-Agent: %s" % ua,
         "Allow: INVITE, ACK, CANCEL, BYE, REFER, OPTIONS, NOTIFY, SUBSCRIBE, PRACK, MESSAGE, INFO, UPDATE",
         "Supported: replaces, outbound, gruu, path",
         "Expires: %d" % rc([300,600,1800,3600]),
-        "Content-Length: 0",
-        "", ""
+        "Content-Length: 0", "", ""
     ]
     return "\r\n".join(lines).encode()
 
-# ── TLS 1.3 ClientHello (RFC 8446) ─────────────────────
-# I1 имитирует начало TLS-рукопожатия браузера (Chrome/Firefox-like).
-# Самый устойчивый паттерн в РФ 2026: DPI не режет TLS ClientHello на
-# произвольном порту — выглядит как обычный заход на сайт. SNI берётся
-# из пула легитимных доменов.
-def gen_tls_clienthello(domain=None):
-    host = (domain or DOMAIN).encode()
-    exts = b""
-    sni_entry = b"\x00" + u16(len(host)) + host
-    sni_list  = u16(len(sni_entry)) + sni_entry
-    exts += u16(0x0000) + u16(len(sni_list)) + sni_list
-    groups = b"\x00\x1d" + b"\x00\x17" + b"\x00\x18"
-    sg = u16(len(groups)) + groups
-    exts += u16(0x000a) + u16(len(sg)) + sg
-    epf = b"\x01\x00"
-    exts += u16(0x000b) + u16(len(epf)) + epf
-    sigs = b"\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01\x02\x01"
-    sa = u16(len(sigs)) + sigs
-    exts += u16(0x000d) + u16(len(sa)) + sa
-    sv = b"\x04" + b"\x03\x04" + b"\x03\x03"
-    exts += u16(0x002b) + u16(len(sv)) + sv
-    ks_entry = b"\x00\x1d" + u16(32) + rh(32)
-    ks = u16(len(ks_entry)) + ks_entry
-    exts += u16(0x0033) + u16(len(ks)) + ks
-    alpn_protos = b"\x02h2\x08http/1.1"
-    alpn = u16(len(alpn_protos)) + alpn_protos
-    exts += u16(0x0010) + u16(len(alpn)) + alpn
-    pad_len = ri(0, 140)
-    exts += u16(0x0015) + u16(pad_len) + (b"\x00" * pad_len)
-    legacy_version = b"\x03\x03"
-    random_bytes   = rh(32)
-    session_id     = rh(32)
-    sid            = bytes([len(session_id)]) + session_id
-    ciphers = (b"\x13\x01\x13\x02\x13\x03"
-               b"\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
-               b"\xcc\xa9\xcc\xa8"
-               b"\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35")
-    cs   = u16(len(ciphers)) + ciphers
-    comp = b"\x01\x00"
-    body = legacy_version + random_bytes + sid + cs + comp + u16(len(exts)) + exts
-    hs   = b"\x01" + u24(len(body)) + body
-    rec  = b"\x16" + b"\x03\x01" + u16(len(hs)) + hs
-    return rec
-
-# ── DNS Query c EDNS0 ───────────────────────────────────
-# Современные клиенты (systemd-resolved, Chrome, dnsmasq) всегда шлют
-# EDNS0 OPT-RR с advertised buffer size. Без него запрос выглядит как
-# legacy-резолвер — редкий паттерн в современном трафике.
-# I1 начинается с <r 2> (TXID), остальные — тоже с TXID.
+# ================================================================
+# DNS Query w/ EDNS0 (unchanged from legacy engine)
+# ================================================================
 def gen_dns(domain=None):
-    host  = domain or DOMAIN
-    flags = b"\x01\x00"   # QR=0 Query, RD=1
-    # counts: QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1 (для OPT-RR)
+    host = domain or DOMAIN
+    flags = b"\x01\x00"
     counts = b"\x00\x01\x00\x00\x00\x00\x00\x01"
-    qn    = b""
+    qn = b""
     for lbl in host.split("."):
-        # Защита от лейблов > 63 байт (DNS RFC 1035)
         lbl_b = lbl.encode()[:63]
         qn += bytes([len(lbl_b)]) + lbl_b
     qn += b"\x00"
-    # Тип запроса: A(1) ~60%, AAAA(28) ~30%, TXT(16) ~10%
-    # Современные резолверы шлют все три типа — чистый A-only паттерн редок
-    qtype  = u16(_weighted_choice([1, 28, 16], [60, 30, 10]))
-    qclass = b"\x00\x01"   # IN
-    # EDNS0 OPT-RR (RFC 6891):
-    #   NAME=root(0x00), TYPE=OPT(41=0x29), CLASS=UDP_size (1232/4096),
-    #   TTL=ext_rcode(0)+version(0)+flags(0/DO=0x8000), RDLEN=0
-    udp_size = rc([1232, 4096])   # 1232 — systemd-resolved, 4096 — bind/dnsmasq
-    do_bit   = rc([0x0000, 0x8000])  # DO=0 чаще, DO=1 для DNSSEC-aware
-    opt_rr   = (b"\x00" + b"\x00\x29" + u16(udp_size) +
-                b"\x00\x00" + u16(do_bit) + b"\x00\x00")
+    qtype = u16(_weighted_choice([1, 28, 16], [60, 30, 10]))
+    qclass = b"\x00\x01"
+    udp_size = rc([1232, 4096])
+    do_bit = rc([0x0000, 0x8000])
+    opt_rr = b"\x00" + b"\x00\x29" + u16(udp_size) + b"\x00\x00" + u16(do_bit) + b"\x00\x00"
     return flags + counts + qn + qtype + qclass + opt_rr
 
-# ── Dispatch ─────────────────────────────────────────────
+# == Dispatch (identical contract: 1 line per packet, up to 5) ==
 if PROFILE == "sip":
-    # I1 = SIP REGISTER (основной)
     print(to_cps(gen_sip()))
     if not ONLY_I1:
-        # I2-I5 = разные SIP пакеты для разнообразия паттерна
         for _ in range(4):
             print(to_cps(gen_sip()))
 
 elif PROFILE == "dns":
-    # I1 = DOMAIN (для Lite = icloud.com, для Pro = выбранный домен)
-    # I2-I5 = разные домены из пула (только если не ONLY_I1)
     print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
     if not ONLY_I1:
         pool = DOMAIN_POOL.copy()
         secure_shuffle(pool)
         for i in range(4):
-            dom = pool[i % len(pool)]
-            print("<r 2><b 0x%s>" % gen_dns(dom).hex())
+            print("<r 2><b 0x%s>" % gen_dns(pool[i % len(pool)]).hex())
 
 elif PROFILE == "tls":
     print(to_cps(gen_tls_clienthello(DOMAIN)))
@@ -733,12 +797,12 @@ elif PROFILE == "tls":
         for i in range(4):
             print(to_cps(gen_tls_clienthello(pool[i % len(pool)])))
 
-else:  # quic (default)
-    i1_pkt = gen_quic_initial(DOMAIN)
+else:  # quic
+    i1_pkt, dcid, ver = gen_quic_initial(DOMAIN)
     print(to_cps(i1_pkt))
     if not ONLY_I1:
-        print(to_cps(gen_quic_second_initial(i1_pkt)))  # I2 = второй Initial (300-600B, тот же DCID)
-        for _ in range(3):                              # I3-I5 = Short Header 1-RTT
+        print(to_cps(gen_quic_second_initial(dcid, ver)))
+        for _ in range(3):
             print(to_cps(gen_quic_short()))
 '
 
@@ -2813,6 +2877,9 @@ do_gen() {
   srv_pub=$(echo "$srv_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed"; return 1; }
   cli_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed (client)"; return 1; }
   cli_pub=$(echo "$cli_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed (client)"; return 1; }
+  # Имя первого клиента: рандом 5 строчных букв + "_" + 2 цифры (напр. xkqve_73)
+  FIRST_CLIENT_NAME="$(tr -dc 'a-z' </dev/urandom | head -c5)_$(tr -dc '0-9' </dev/urandom | head -c2)"
+  [[ "$FIRST_CLIENT_NAME" =~ ^[a-z]{5}_[0-9]{2}$ ]] || FIRST_CLIENT_NAME="client1"
   psk=$(awg genpsk 2>/dev/null) || { err "awg genpsk failed"; return 1; }
 
   info "Определение внешнего IP..."
@@ -2877,7 +2944,7 @@ do_gen() {
     echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
     echo ""
     echo "[Peer]"
-    echo "# client1"
+    echo "# $FIRST_CLIENT_NAME"
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $CLIENT_ADDR"
@@ -2905,8 +2972,8 @@ do_gen() {
     echo "Endpoint = $srv_ip:$PORT"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = 25"
-  } > /root/client1_awg2.conf
-  chmod 600 /root/client1_awg2.conf
+  } > /root/${FIRST_CLIENT_NAME}_awg2.conf
+  chmod 600 /root/${FIRST_CLIENT_NAME}_awg2.conf
 
   if awg-quick up "$SERVER_CONF"; then
     log_info "do_gen: awg-quick up успешно"
@@ -2939,14 +3006,14 @@ do_gen() {
   fi
 
   # Раздача конфига
-  _share_config "/root/client1_awg2.conf"
+  _share_config "/root/${FIRST_CLIENT_NAME}_awg2.conf"
 
   echo ""
   success_box "■  Сервер создан успешно"
   echo -e "${W}  Версия : ${N}$AWG_VERSION"
   echo -e "${W}  Профиль: ${N}${MIMICRY_PROFILE:-none}"
   echo -e "${W}  Сервер : ${N}$SERVER_CONF"
-  echo -e "${W}  Клиент : ${N}/root/client1_awg2.conf"
+  echo -e "${W}  Клиент : ${N}/root/${FIRST_CLIENT_NAME}_awg2.conf"
   echo -e "${W}  IP     : ${N}$srv_ip:$PORT"
   echo -e "${W}  Iface  : ${N}$iface"
 
