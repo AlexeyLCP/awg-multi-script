@@ -39,7 +39,7 @@ tg_api() {
 }
 
 # ── Самообновление установщика с GitHub ──────────────────────────────────────
-INSTALLER_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg-bot-install.sh"
 
 # Тянет свежую версию ЭТОГО скрипта с GitHub и, если она новее/отличается,
 # перезапускает её (с флагом-предохранителем против рекурсии). Код бота вшит
@@ -3594,6 +3594,17 @@ ok "Бот установлен в $BOT_PY"
 echo ""
 info "Создаю systemd unit..."
 
+local ENV_PROXY=""
+if [[ -f "/etc/xray/config.json" ]]; then
+  echo ""
+  local USE_X
+  read -rp "$(echo -e "${C}  У вас установлен Xray. Использовать его SOCKS-прокси (127.0.0.1:10101) для работы бота? [y/N]: ${N}")" USE_X
+  if [[ "${USE_X,,}" == "y" ]]; then
+    ENV_PROXY="Environment=\"HTTPS_PROXY=socks5://127.0.0.1:10101\""
+    ok "Включена маршрутизация бота через Xray"
+  fi
+fi
+
 cat > "$BOT_SERVICE" << EOF
 [Unit]
 Description=AWG Toolza Telegram Bot
@@ -3603,6 +3614,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+$ENV_PROXY
 ExecStart=/usr/bin/python3 $BOT_PY
 Restart=on-failure
 RestartSec=10
