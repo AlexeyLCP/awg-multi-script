@@ -9309,6 +9309,22 @@ def parse_link(link):
                 "security": qs.get("security", ["none"])[0]
             }
         }
+        # Transport-настройки для ws/grpc (без path/serviceName vless+ws/grpc
+        # стучатся на "/" и не подключаются к реальному backend).
+        _net = outbound["streamSettings"]["network"]
+        if _net == "ws":
+            _ws = {}
+            if "path" in qs:
+                _ws["path"] = qs["path"][0]
+            if "host" in qs:
+                _ws["headers"] = {"Host": qs["host"][0]}
+            outbound["streamSettings"]["wsSettings"] = _ws
+        elif _net == "grpc":
+            _grpc = {}
+            if "serviceName" in qs:
+                _grpc["serviceName"] = qs["serviceName"][0]
+            outbound["streamSettings"]["grpcSettings"] = _grpc
+
         if outbound["streamSettings"]["security"] == "tls" or outbound["streamSettings"]["security"] == "reality":
             tls_settings = {"serverName": qs.get("sni", [""])[0], "fingerprint": qs.get("fp", ["chrome"])[0]}
             if "pbk" in qs:
@@ -9341,6 +9357,23 @@ def parse_link(link):
                 "security": data.get("tls", "none")
             }
         }
+        # Transport-настройки для ws/grpc (vmess: path/host для ws; для grpc
+        # serviceName historically лежит в "path" или "svc").
+        _net = outbound["streamSettings"]["network"]
+        if _net == "ws":
+            _ws = {}
+            if data.get("path"):
+                _ws["path"] = data.get("path")
+            if data.get("host"):
+                _ws["headers"] = {"Host": data.get("host")}
+            outbound["streamSettings"]["wsSettings"] = _ws
+        elif _net == "grpc":
+            _grpc = {}
+            _svc = data.get("serviceName") or data.get("svc") or data.get("path")
+            if _svc:
+                _grpc["serviceName"] = _svc
+            outbound["streamSettings"]["grpcSettings"] = _grpc
+
         if outbound["streamSettings"]["security"] == "tls":
              outbound["streamSettings"]["tlsSettings"] = {"serverName": data.get("sni", "")}
         print(json.dumps(outbound))
@@ -9543,10 +9576,15 @@ else:
     rules.append({'type': 'field', 'inboundTag': ['tun-in'], 'balancerTag': 'balancer'})
 conf['routing']['rules'] = rules
 
-# leastPing/leastLoad требуют observatory
+# leastPing/leastLoad требуют observatory.
+# subjectSelector — ПРЕФИКСНОЕ сопоставление с тегами outbounds (доки Xray).
+# Теги наших outbounds — "proxy_<host>", поэтому ['outbound'] не совпадало ни с
+# одним → observatory не пробил ничего → leastPing/leastLoad исключали ВСЕ
+# outbounds и деградировали до default outbound (балансировки не было).
+# Берём сами теги балансировщика:
 if strategy in ('leastPing', 'leastLoad'):
     conf['observatory'] = {
-        'subjectSelector': ['outbound'],
+        'subjectSelector': tags,
         'probeUrl': 'https://www.google.com/generate_204',
         'probeInterval': '1m'
     }
@@ -9573,9 +9611,23 @@ _xray_up() {
     return 0
   fi
 
+  # Guard: начальный конфиг (после _xray_install) ссылается на outboundTag
+  # "proxy", которого нет до добавления первого outbound. Без proxy outbounds
+  # Xray стартует с правилом в никуда (дроп/ошибка). Не пускаем.
+  if ! python3 -c "import json; conf=json.load(open('$XRAY_CONF')); exit(0 if [o for o in conf.get('outbounds',[]) if o.get('tag') and o.get('tag')!='direct' and o.get('protocol')!='freedom'] else 1)" 2>/dev/null; then
+    err "Нет настроенных proxy outbounds. Сначала добавьте outbound (пункт 2), затем включайте туннель."
+    return 1
+  fi
+
   if ip link show warp0 &>/dev/null; then
     err "Туннель Warp активен! Xray и Warp не могут работать одновременно."
-    warn "Выключи Warp (пункт 15 -> 4), затем включай Xray."
+    warn "Выключи Warp (пункт 5 -> 1 -> 4), затем включай Xray."
+    return 1
+  fi
+
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    err "Каскад AWG-exit активен! Xray и каскад не могут работать одновременно."
+    warn "Выключи каскад (пункт 5 -> 6 -> 4), затем включай Xray."
     return 1
   fi
 
@@ -9899,6 +9951,12 @@ _tun2socks_up() {
   fi
   if ip link show xray0 &>/dev/null; then
     err "Туннель Xray активен! Xray и tun2socks не могут работать одновременно."
+    return 1
+  fi
+
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    err "Каскад AWG-exit активен! tun2socks и каскад не могут работать одновременно."
+    warn "Выключи каскад (пункт 5 -> 6 -> 4), затем включай tun2socks."
     return 1
   fi
 
