@@ -9662,7 +9662,12 @@ with open('$XRAY_CONF', 'w') as f:
     iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu
 
   ip route add default dev "$tun_dev" table 201 2>/dev/null || true
-  ip rule add from "$client_net" table 201 priority 201 2>/dev/null || true
+  # Селективность по клиентам — только через per-IP правила из $XRAY_PEERS
+  # (как в Warp, см. _warp_up). НЕ добавляем blanket from $client_net: иначе
+  # меню «Клиенты в Xray туннеле» (пункт 8) игнорируется и ВСЕ клиенты подсети
+  # идут через Xray даже после «Выключить всех» / перевода клиента в «напрямую».
+  # Чистим возможное blanket-правило от старой версии:
+  ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
 
   _xray_sync_peers 2>/dev/null || true
   if [[ ! -s "$XRAY_PEERS" ]]; then
