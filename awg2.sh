@@ -10837,6 +10837,43 @@ _exits_apply_routing() {
   fi
 }
 
+_ensure_peers_mode() {
+  # В mode=all per-client переключатели в do_exits_peers_menu не действуют:
+  # start_routing добавляет blanket from $client_net lookup 202, который
+  # перекрывает per-IP правила (ip rule del для одного IP — no-op, blanket остаётся).
+  # При первом togglingе переключаемся в mode=peers: переносим всех текущих
+  # клиентов в $AWG_EXITS_PEERS (поведение «все через каскад» сохраняется как
+  # стартовый набор), перезапускаем start_routing — blanket убирается, per-IP
+  # добавляются. Дальше переключатели реально управляют маршрутизацией.
+  [[ -f "$AWG_EXITS_STATE" ]] || return 0
+  local mode
+  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+  [[ "$mode" == "all" ]] || return 0
+  systemctl is-active --quiet awg-exits-routing.service 2>/dev/null || return 0
+
+  local balancer single_exit
+  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "single")
+  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "")
+
+  mkdir -p "$AWG_EXITS_DIR"
+  : > "$AWG_EXITS_PEERS"
+  while IFS='|' read -r _name ip; do
+    [[ -z "$ip" ]] && continue
+    echo "$ip" >> "$AWG_EXITS_PEERS"
+  done < <(_warp_list_awg_clients)
+
+  cat > "$AWG_EXITS_STATE" << EOF
+active
+mode=peers
+balancer=$balancer
+single_exit=$single_exit
+EOF
+
+  /usr/local/bin/awg2-exits-routing.sh stop >/dev/null 2>&1 || true
+  /usr/local/bin/awg2-exits-routing.sh start >/dev/null 2>&1 || true
+  info "Каскад переведён в режим «Выборочно по списку» — per-client переключатели активированы."
+}
+
 do_exits_peers_menu() {
   set +e
   while true; do
@@ -10880,6 +10917,12 @@ do_exits_peers_menu() {
     echo ""
     local PEER_CHOICE=""
     read -rp "$(echo -e "${C}  Выбор: ${N}")" PEER_CHOICE
+
+    # В mode=all per-client переключатели не действуют (blanket from $client_net
+    # lookup 202 перекрывает per-IP) — переключаемся в peers перед действием:
+    if [[ -n "${PEER_CHOICE:-}" && "${PEER_CHOICE:-}" != "0" ]]; then
+      _ensure_peers_mode
+    fi
 
     case "${PEER_CHOICE:-}" in
       0|"") set -e; return 0 ;;
