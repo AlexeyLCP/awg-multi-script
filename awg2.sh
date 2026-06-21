@@ -5022,6 +5022,17 @@ _warp_get_client_net() {
   fi
   local addr
   addr=$(awk '/^Address/{print $3; exit}' "$SERVER_CONF")
+  [[ -z "$addr" ]] && { echo ""; return 1; }
+  addr="${addr%%,*}"   # только первый IPv4 (dual-stack safe)
+  # Корректная база сети для любого префикса (не только /24). Раньше ставили
+  # 4-й октет в .0 — для /23,/22 с сервером в верхней половине диапазона
+  # получалась неверная сеть и часть клиентов выпадала из правила.
+  if command -v python3 &>/dev/null; then
+    local net
+    net=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$addr" 2>/dev/null) \
+      && [[ -n "$net" ]] && { echo "$net"; return 0; }
+  fi
+  # Fallback (корректен только для /24): 4-й октет в .0
   if [[ "$addr" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/([0-9]+)$ ]]; then
     echo "${BASH_REMATCH[1]}.0/${BASH_REMATCH[2]}"
     return 0
@@ -10163,6 +10174,16 @@ get_client_net() {
   local addr
   addr=$(awk -F'=' '/^Address/{gsub(/ /,"",$2); print $2; exit}' "$SERVER_CONF")
   [[ -z "$addr" ]] && return 1
+  addr="${addr%%,*}"   # только первый IPv4 (dual-stack safe)
+  # Корректная база сети для ЛЮБОГО префикса (не только /24).
+  # Раньше тупо ставили 4-й октет в .0 — для /23,/22 с сервером в верхней
+  # половине диапазона получалась неверная сеть и часть клиентов выпадала.
+  if command -v python3 &>/dev/null; then
+    local net
+    net=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$addr" 2>/dev/null) \
+      && [[ -n "$net" ]] && { echo "$net"; return 0; }
+  fi
+  # Fallback (корректен только для /24): 4-й октет в .0
   local ip_part="${addr%/*}"
   local mask="${addr#*/}"
   echo "$ip_part" | awk -F. -v m="$mask" '{print $1"."$2"."$3".0/"m}'
