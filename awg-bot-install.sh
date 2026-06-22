@@ -79,7 +79,38 @@ self_update_installer() {
     return 0
   fi
 
-  ok "Найдена свежая версия — перезапускаю её"
+  ok "Найдена свежая версия — проверяю целостность..."
+
+  # Проверка SHA256 (если файл .sha256 доступен)
+  local sha_url="${INSTALLER_URL%/*}/awg-bot-install.sh.sha256"
+  local sha_expected sha_actual
+  sha_expected=$(curl -fsSL "$sha_url" 2>/dev/null | awk '{print $1}')
+  sha_actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+
+  if [[ -n "$sha_expected" && -n "$sha_actual" ]]; then
+    if [[ "$sha_expected" != "$sha_actual" ]]; then
+      err "Контрольная сумма не совпадает! Скачанный файл повреждён или подменён."
+      err "Ожидался: $sha_expected"
+      err "Получен:  $sha_actual"
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    fi
+    ok "SHA256 проверен — файл целостен"
+  else
+    # Файл .sha256 недоступен — спрашиваем подтверждение
+    warn "Не удалось проверить SHA256 (файл .sha256 недоступен)"
+    if [[ "${AWG_BOT_AUTO_CHOICE:-}" == "2" ]]; then
+      warn "Запуск без проверки целостности (автоматический режим). Рекомендуется опубликовать awg-bot-install.sh.sha256"
+    else
+      read -rp "Запустить скачанный скрипт без проверки целостности? [y/N]: " _confirm
+      if [[ "${_confirm,,}" != "y" ]]; then
+        warn "Обновление отменено пользователем"
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
+
   chmod +x "$tmp" 2>/dev/null || true
   # Перезапускаем новую версию с тем же выбором меню (пункт 2 = Обновить),
   # флаг AWG_BOT_SELFUPDATED предотвращает повторное скачивание.
@@ -244,6 +275,7 @@ do_update_bot() {
   ok "Конфиг найден: $BOT_CONF"
 
   # Парсим старые значения для переустановки
+  local OLD_TOKEN OLD_CHAT_ID
   OLD_TOKEN=$(grep -E '^BOT_TOKEN=' "$BOT_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || echo "")
   OLD_CHAT_ID=$(grep -E '^ADMIN_CHAT_ID=' "$BOT_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || echo "")
 
@@ -291,21 +323,27 @@ fi
 ok "AWG Toolza найден"
 
 # ── Шаг 2: Зависимости ───────────────────────────────────────────────────────
-echo ""
-info "Устанавливаю зависимости..."
+if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
+  echo ""
+  info "Устанавливаю зависимости..."
 
-apt-get update -qq 2>/dev/null || true
-apt-get install -y -qq python3 python3-pip qrencode 2>/dev/null || {
-  err "Ошибка apt-get. Проверь интернет."; exit 1
-}
-ok "python3, pip, qrencode установлены"
+  apt-get update -qq 2>/dev/null || true
+  apt-get install -y -qq python3 python3-pip qrencode 2>/dev/null || {
+    err "Ошибка apt-get. Проверь интернет."
+    apt-get install -y -qq python3 python3-pip qrencode 2>&1 | tail -20 >&2
+    exit 1
+  }
+  ok "python3, pip, qrencode установлены"
 
-info "Устанавливаю python-telegram-bot..."
-pip3 install "python-telegram-bot>=20" --break-system-packages -q 2>/dev/null || \
-  pip3 install "python-telegram-bot>=20" -q 2>/dev/null || {
-  err "Ошибка pip. Попробуй вручную: pip3 install python-telegram-bot"
-  exit 1
-}
+  info "Устанавливаю python-telegram-bot..."
+  pip3 install "python-telegram-bot>=20" --break-system-packages -q 2>/dev/null || \
+    pip3 install "python-telegram-bot>=20" -q 2>/dev/null || {
+    err "Ошибка pip. Попробуй вручную: pip3 install python-telegram-bot"
+    exit 1
+  }
+else
+  ok "Зависимости уже установлены (SKIP_DEPS=1)"
+fi
 PTB_VER=$(python3 -c "import telegram; print(telegram.__version__)" 2>/dev/null || echo "?")
 ok "python-telegram-bot $PTB_VER установлен"
 
@@ -411,16 +449,20 @@ info "Сохраняю конфиг в $BOT_CONF..."
 
 # Если конфиг уже есть — бекап
 if [[ -f "$BOT_CONF" ]]; then
-  cp "$BOT_CONF" "${BOT_CONF}.bak.$(date +%s)"
+  cp -p "$BOT_CONF" "${BOT_CONF}.bak.$(date +%s)"
   warn "Старый конфиг сохранён как ${BOT_CONF}.bak.*"
+  # Ротация старых бекапов (оставляем последние 30 дней)
+  find /etc -maxdepth 1 -name 'awg-bot.conf.bak.*' -mtime +30 -delete 2>/dev/null || true
 fi
 
-cat > "$BOT_CONF" << EOF
+# Создаём файл с правильными правами ДО записи (umask 077)
+( umask 077; cat > "$BOT_CONF" << EOF
 # AWG Toolza Bot — конфиг
 # Создан: $(date '+%Y-%m-%d %H:%M:%S')
 BOT_TOKEN="${BOT_TOKEN}"
 ADMIN_CHAT_ID="${ADMIN_CHAT_ID}"
 EOF
+)
 
 chmod 600 "$BOT_CONF"
 ok "Конфиг сохранён (права 600)"
@@ -566,9 +608,14 @@ def run(cmd: list, input_str: Optional[str] = None) -> tuple:
     # LC_ALL=C форсит английский вывод (иначе на русской локали "latest handshake"
     # парсится неверно и все клиенты показываются оффлайн).
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-    r = subprocess.run(cmd, capture_output=True, text=True, input=input_str,
-                       timeout=30, env=env)
-    return r.returncode, r.stdout, r.stderr
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, input=input_str,
+                           timeout=30, env=env)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except FileNotFoundError:
+        return -1, "", "command not found"
 
 
 def get_clients() -> list:
@@ -808,6 +855,22 @@ def _expire_apply_syncconf() -> bool:
     return rc2 == 0
 
 
+import contextlib as _ctxlib
+
+@_ctxlib.contextmanager
+def _server_conf_lock():
+    """Межпроцессный лок на SERVER_CONF (через /run/awg-bot.lock).
+    Используется всеми функциями, которые делают read-modify-write
+    SERVER_CONF: add_client, expire_set/clear, note_set/clear."""
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def expire_set(name: str, expires_ts: int) -> tuple:
     """Поставить срок клиенту. Возвращает (ok, msg).
     Минимум — 1 час от текущего момента."""
@@ -817,51 +880,52 @@ def expire_set(name: str, expires_ts: int) -> tuple:
     if not Path(SERVER_CONF).exists():
         return False, "Серверный конфиг не найден"
 
-    try:
-        text = Path(SERVER_CONF).read_text()
-    except OSError as e:
-        return False, f"read: {e}"
-
-    parts  = re.split(r"(?=\[Peer\])", text)
-    header = parts[0]
-    peers  = parts[1:]
-
-    found = False
-    out_peers = []
-    for block in peers:
-        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
-        if nm and nm.group(1).strip() == name:
-            found = True
-            # Заменить или добавить # expires=
-            if re.search(r"^#\s*expires=\d+\s*$", block, re.M):
-                block = re.sub(r"^#\s*expires=\d+\s*$",
-                               f"# expires={expires_ts}", block, count=1, flags=re.M)
-            else:
-                block = re.sub(
-                    r"(^#\s+" + re.escape(name) + r"\s*$)",
-                    lambda m: m.group(1) + f"\n# expires={expires_ts}",
-                    block, count=1, flags=re.M
-                )
-        out_peers.append(block)
-
-    if not found:
-        return False, f"клиент {name} не найден"
-
-    new_text = header + "".join(out_peers)
-    try:
-        d = os.path.dirname(SERVER_CONF)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+    with _server_conf_lock():
         try:
-            with os.fdopen(fd, "w") as f:
-                f.write(new_text)
-            os.chmod(tmp, 0o600)
-            os.rename(tmp, SERVER_CONF)
-        except Exception:
-            try: os.unlink(tmp)
-            except Exception: pass
-            raise
-    except Exception as e:
-        return False, f"write: {e}"
+            text = Path(SERVER_CONF).read_text()
+        except OSError as e:
+            return False, f"read: {e}"
+
+        parts  = re.split(r"(?=\[Peer\])", text)
+        header = parts[0]
+        peers  = parts[1:]
+
+        found = False
+        out_peers = []
+        for block in peers:
+            nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+            if nm and nm.group(1).strip() == name:
+                found = True
+                # Заменить или добавить # expires=
+                if re.search(r"^#\s*expires=\d+\s*$", block, re.M):
+                    block = re.sub(r"^#\s*expires=\d+\s*$",
+                                   f"# expires={expires_ts}", block, count=1, flags=re.M)
+                else:
+                    block = re.sub(
+                        r"(^#\s+" + re.escape(name) + r"\s*$)",
+                        lambda m: m.group(1) + f"\n# expires={expires_ts}",
+                        block, count=1, flags=re.M
+                    )
+            out_peers.append(block)
+
+        if not found:
+            return False, f"клиент {name} не найден"
+
+        new_text = header + "".join(out_peers)
+        try:
+            d = os.path.dirname(SERVER_CONF)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(new_text)
+                os.chmod(tmp, 0o600)
+                os.rename(tmp, SERVER_CONF)
+            except Exception:
+                try: os.unlink(tmp)
+                except Exception: pass
+                raise
+        except Exception as e:
+            return False, f"write: {e}"
 
     _expire_apply_syncconf()  # не критично если не получилось — таймер подхватит
 
@@ -881,49 +945,51 @@ def expire_clear(name: str) -> tuple:
     """Снять срок. Если клиент был suspended — вернуть оригинальный IP."""
     if not Path(SERVER_CONF).exists():
         return False, "Серверный конфиг не найден"
-    try:
-        text = Path(SERVER_CONF).read_text()
-    except OSError as e:
-        return False, f"read: {e}"
 
-    parts  = re.split(r"(?=\[Peer\])", text)
-    header = parts[0]
-    peers  = parts[1:]
-
-    found = False
-    out_peers = []
-    for block in peers:
-        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
-        if nm and nm.group(1).strip() == name:
-            found = True
-            orig_m = re.search(r"^#\s*orig_ips=(.+?)\s*$", block, re.M)
-            aip_m  = re.search(r"^AllowedIPs\s*=\s*(.+?)\s*$", block, re.M)
-            if orig_m and aip_m and aip_m.group(1).strip() == EXPIRE_SUSPEND_IP:
-                block = re.sub(r"^(AllowedIPs\s*=\s*).+$",
-                               r"\g<1>" + orig_m.group(1).strip(),
-                               block, count=1, flags=re.M)
-            block = re.sub(r"^#\s*expires=\d+\s*\n",   "", block, flags=re.M)
-            block = re.sub(r"^#\s*orig_ips=.+?\s*\n",  "", block, flags=re.M)
-        out_peers.append(block)
-
-    if not found:
-        return False, f"клиент {name} не найден"
-
-    new_text = header + "".join(out_peers)
-    try:
-        d = os.path.dirname(SERVER_CONF)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+    with _server_conf_lock():
         try:
-            with os.fdopen(fd, "w") as f:
-                f.write(new_text)
-            os.chmod(tmp, 0o600)
-            os.rename(tmp, SERVER_CONF)
-        except Exception:
-            try: os.unlink(tmp)
-            except Exception: pass
-            raise
-    except Exception as e:
-        return False, f"write: {e}"
+            text = Path(SERVER_CONF).read_text()
+        except OSError as e:
+            return False, f"read: {e}"
+
+        parts  = re.split(r"(?=\[Peer\])", text)
+        header = parts[0]
+        peers  = parts[1:]
+
+        found = False
+        out_peers = []
+        for block in peers:
+            nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+            if nm and nm.group(1).strip() == name:
+                found = True
+                orig_m = re.search(r"^#\s*orig_ips=(.+?)\s*$", block, re.M)
+                aip_m  = re.search(r"^AllowedIPs\s*=\s*(.+?)\s*$", block, re.M)
+                if orig_m and aip_m and aip_m.group(1).strip() == EXPIRE_SUSPEND_IP:
+                    block = re.sub(r"^(AllowedIPs\s*=\s*).+$",
+                                   r"\g<1>" + orig_m.group(1).strip(),
+                                   block, count=1, flags=re.M)
+                block = re.sub(r"^#\s*expires=\d+\s*\n",   "", block, flags=re.M)
+                block = re.sub(r"^#\s*orig_ips=.+?\s*\n",  "", block, flags=re.M)
+            out_peers.append(block)
+
+        if not found:
+            return False, f"клиент {name} не найден"
+
+        new_text = header + "".join(out_peers)
+        try:
+            d = os.path.dirname(SERVER_CONF)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(new_text)
+                os.chmod(tmp, 0o600)
+                os.rename(tmp, SERVER_CONF)
+            except Exception:
+                try: os.unlink(tmp)
+                except Exception: pass
+                raise
+        except Exception as e:
+            return False, f"write: {e}"
 
     _expire_apply_syncconf()
     return True, "ok"
@@ -960,53 +1026,56 @@ def note_set(name: str, note_text: str) -> tuple:
         return False, "Заметка слишком длинная (макс 200 символов)"
     if not Path(SERVER_CONF).exists():
         return False, "Серверный конфиг не найден"
-    try:
-        text = Path(SERVER_CONF).read_text()
-    except OSError as e:
-        return False, f"read: {e}"
 
     encoded = base64.b64encode(note_text.encode("utf-8")).decode("ascii")
 
-    parts  = re.split(r"(?=\[Peer\])", text)
-    header = parts[0]
-    peers  = parts[1:]
-
-    found = False
-    out_peers = []
-    for block in peers:
-        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
-        if nm and nm.group(1).strip() == name:
-            found = True
-            if re.search(r"^#\s*note=.*$", block, re.M):
-                block = re.sub(r"^#\s*note=.*$", f"# note={encoded}",
-                               block, count=1, flags=re.M)
-            else:
-                # Вставляем после комментария-имени
-                block = re.sub(
-                    r"(^#\s+" + re.escape(name) + r"\s*$)",
-                    lambda m: m.group(1) + f"\n# note={encoded}",
-                    block, count=1, flags=re.M
-                )
-        out_peers.append(block)
-
-    if not found:
-        return False, f"клиент {name} не найден"
-
-    new_text = header + "".join(out_peers)
-    try:
-        d = os.path.dirname(SERVER_CONF)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+    with _server_conf_lock():
         try:
-            with os.fdopen(fd, "w") as f:
-                f.write(new_text)
-            os.chmod(tmp, 0o600)
-            os.rename(tmp, SERVER_CONF)
-        except Exception:
-            try: os.unlink(tmp)
-            except Exception: pass
-            raise
-    except Exception as e:
-        return False, f"write: {e}"
+            text = Path(SERVER_CONF).read_text()
+        except OSError as e:
+            return False, f"read: {e}"
+
+        parts  = re.split(r"(?=\[Peer\])", text)
+        header = parts[0]
+        peers  = parts[1:]
+
+        found = False
+        out_peers = []
+        for block in peers:
+            nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+            if nm and nm.group(1).strip() == name:
+                found = True
+                if re.search(r"^#\s*note=.*$", block, re.M):
+                    block = re.sub(r"^#\s*note=.*$", f"# note={encoded}",
+                                   block, count=1, flags=re.M)
+                else:
+                    # Вставляем после комментария-имени
+                    block = re.sub(
+                        r"(^#\s+" + re.escape(name) + r"\s*$)",
+                        lambda m: m.group(1) + f"\n# note={encoded}",
+                        block, count=1, flags=re.M
+                    )
+            out_peers.append(block)
+
+        if not found:
+            return False, f"клиент {name} не найден"
+
+        new_text = header + "".join(out_peers)
+        try:
+            d = os.path.dirname(SERVER_CONF)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(new_text)
+                os.chmod(tmp, 0o600)
+                os.rename(tmp, SERVER_CONF)
+            except Exception:
+                try: os.unlink(tmp)
+                except Exception: pass
+                raise
+        except Exception as e:
+            return False, f"write: {e}"
+
     # Заметка — это только комментарий, syncconf не нужен (awg его игнорирует),
     # но конфиг изменён, поэтому инвалидируем кэш на стороне вызова.
     return True, "ok"
@@ -1016,42 +1085,45 @@ def note_clear(name: str) -> tuple:
     """Удалить заметку у клиента."""
     if not Path(SERVER_CONF).exists():
         return False, "Серверный конфиг не найден"
-    try:
-        text = Path(SERVER_CONF).read_text()
-    except OSError as e:
-        return False, f"read: {e}"
 
-    parts  = re.split(r"(?=\[Peer\])", text)
-    header = parts[0]
-    peers  = parts[1:]
-
-    found = False
-    out_peers = []
-    for block in peers:
-        nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
-        if nm and nm.group(1).strip() == name:
-            found = True
-            block = re.sub(r"^#\s*note=.*\n", "", block, flags=re.M)
-        out_peers.append(block)
-
-    if not found:
-        return False, f"клиент {name} не найден"
-
-    new_text = header + "".join(out_peers)
-    try:
-        d = os.path.dirname(SERVER_CONF)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+    with _server_conf_lock():
         try:
-            with os.fdopen(fd, "w") as f:
-                f.write(new_text)
-            os.chmod(tmp, 0o600)
-            os.rename(tmp, SERVER_CONF)
-        except Exception:
-            try: os.unlink(tmp)
-            except Exception: pass
-            raise
-    except Exception as e:
-        return False, f"write: {e}"
+            text = Path(SERVER_CONF).read_text()
+        except OSError as e:
+            return False, f"read: {e}"
+
+        parts  = re.split(r"(?=\[Peer\])", text)
+        header = parts[0]
+        peers  = parts[1:]
+
+        found = False
+        out_peers = []
+        for block in peers:
+            nm = re.search(r"^#\s+([^=\n]+?)\s*$", block, re.M)
+            if nm and nm.group(1).strip() == name:
+                found = True
+                block = re.sub(r"^#\s*note=.*\n", "", block, flags=re.M)
+            out_peers.append(block)
+
+        if not found:
+            return False, f"клиент {name} не найден"
+
+        new_text = header + "".join(out_peers)
+        try:
+            d = os.path.dirname(SERVER_CONF)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".awg0.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(new_text)
+                os.chmod(tmp, 0o600)
+                os.rename(tmp, SERVER_CONF)
+            except Exception:
+                try: os.unlink(tmp)
+                except Exception: pass
+                raise
+        except Exception as e:
+            return False, f"write: {e}"
+
     return True, "ok"
 
 
@@ -1154,8 +1226,8 @@ class Keyboards:
         for c in chunk:
             icon = online_icon(stats.get(c["pubkey"], {}).get("last_hs", 0))
             buttons.append(InlineKeyboardButton(
-                f"{icon} {c['name']}  {c['ip'].split('/')[0]}",
-                callback_data=f"c:{c['name']}"
+                f"{icon} {_html.escape(c['name'])}  {c['ip'].split('/')[0]}",
+                callback_data=f"c:{_html.escape(c['name'])}"
             ))
         rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
         # Навигация — только если страниц больше одной
@@ -1509,7 +1581,7 @@ def text_client_card(c: dict) -> str:
         else:
             note_line = f"\n📝 {esc}"
     return (
-        f"👤 <b>{c['name']}</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>{_html.escape(c['name'])}</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"🌐 IP: <code>{c['ip']}</code>\n"
         f"{online_icon(hs)} {elapsed_str(hs)}\n"
         f"↓ {s.get('rx', '—')}  ↑ {s.get('tx', '—')}"
@@ -1732,7 +1804,7 @@ async def _cb_clients(q, page: int = 0):
             ip_clean in warp_ips or f"{ip_clean}/32" in warp_ips
         ) else ""
         lines.append(
-            f"{icon} <b>{c['name']}</b>{warp_mark}  "
+            f"{icon} <b>{_html.escape(c['name'])}</b>{warp_mark}  "
             f"<code>{ip_clean}</code>  "
             f"↓{s.get('rx', '—')} ↑{s.get('tx', '—')}"
         )
@@ -1758,7 +1830,7 @@ async def _cb_status(q):
 
 async def _cb_restart(q):
     await q.edit_message_text("⏳ Перезапускаю awg0...")
-    await asyncio.to_thread(run, ["awg-quick", "down", SERVER_CONF])
+    down_rc, _, down_err = await asyncio.to_thread(run, ["awg-quick", "down", SERVER_CONF])
     await asyncio.sleep(1)
     rc, _, err = await asyncio.to_thread(run, ["awg-quick", "up", SERVER_CONF])
     # После перезапуска инвалидируем кэш
@@ -1767,8 +1839,9 @@ async def _cb_restart(q):
     if rc == 0:
         await q.edit_message_text("✅ awg0 перезапущен")
     else:
+        down_info = f"\n(down stderr: {_html.escape(down_err[:200])})" if down_rc != 0 else ""
         await q.edit_message_text(
-            f"❌ Ошибка:\n<code>{_html.escape(err[:300])}</code>",
+            f"❌ Ошибка:\n<code>{_html.escape(err[:300])}</code>{down_info}",
             parse_mode=ParseMode.HTML
         )
 
@@ -2746,7 +2819,7 @@ async def handle_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             hs   = s.get("last_hs", 0)
             icon = online_icon(hs)
             lines.append(
-                f"{icon} <b>{c['name']}</b>  "
+                f"{icon} <b>{_html.escape(c['name'])}</b>  "
                 f"<code>{c['ip'].split('/')[0]}</code>  "
                 f"↓{s.get('rx', '—')} ↑{s.get('tx', '—')}"
             )
@@ -3351,7 +3424,8 @@ def add_client(name: str, profile: str, admin_id: str = "") -> tuple:
                         i_params += f"\n{labels[i]} = {line.strip()}"
 
         def g(k, default=""):
-            return sp.get(k, default)
+            v = sp.get(k, default)
+            return v if v else default
 
         client_conf = (
             f"[Interface]\n"

@@ -1,0 +1,12 @@
+# Временные файлы (не коммитить!)
+*.conf
+*_debug.log
+claude_debug.log
+new_claude_debug.log
+nodes_config.json
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

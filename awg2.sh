@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.3-lucx"
+VERSION="v6.9.4-lucx"
 UPDATE_URL="https://raw.githubusercontent.com/AlexeyLCP/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -421,7 +421,7 @@ scan_pool() {
 
   # Cleanup при нормальном завершении
   rm -rf "$tmpdir"
-  trap - INT TERM
+  trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
   SCAN_POOL_RESULT=("${available[@]+"${available[@]}"}")
 }
 
@@ -1277,6 +1277,26 @@ do_sniff_test() {
   log_info "DPI тест: клиент=$client_ip verdict=$verdict"
 }
 
+_detect_server_region() {
+  local _region=""
+  if [[ -f "$SERVER_CONF" ]]; then
+    _region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
+  fi
+  _region="${_region:-world}"
+  SERVER_REGION="$_region"
+  if [[ "$_region" == "ru" ]]; then
+    TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
+    DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
+    SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
+    QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+  else
+    TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
+    DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
+    SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
+    QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
+  fi
+}
+
 check_deps() {
   HAS_AWG=false
   HAS_QRENCODE=false
@@ -1301,19 +1321,7 @@ check_deps() {
     local saved_region
     saved_region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
     if [[ -n "$saved_region" ]]; then
-      SERVER_REGION="$saved_region"
-      # Пересобираем активные пулы под регион
-      if [[ "$saved_region" == "ru" ]]; then
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
-      else
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
-      fi
+      _detect_server_region
     fi
   fi
 
@@ -1383,7 +1391,7 @@ rand_range() {
   local lo="$1" hi="$2"
   # Защита: если lo > hi, возвращаем lo (избегаем ошибки python randint)
   if [[ "$lo" -gt "$hi" ]]; then echo "$lo"; return 0; fi
-  python3 -c "import random; print(random.randint($lo, $hi))"
+  python3 -c 'import random, sys; print(random.randint(int(sys.argv[1]), int(sys.argv[2])))' "$lo" "$hi"
 }
 
 # Форматирует секунды в человеческий вид: 5с / 3м12с / 2ч15м / 3д4ч
@@ -1561,7 +1569,8 @@ do_repair() {
 
     # Сверяем количество peer'ов в конфиге и в ядре
     local conf_peers live_peers
-    conf_peers=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || echo "0")
+    conf_peers=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || true)
+    [[ "$conf_peers" =~ ^[0-9]+$ ]] || conf_peers=0
     live_peers=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$conf_peers" != "$live_peers" ]]; then
       warn "Расхождение: в конфиге $conf_peers пиров, в ядре $live_peers"
@@ -1726,6 +1735,24 @@ do_self_update() {
     info "Возможно сетевой сбой при скачивании, попробуй ещё раз"
     rm -f "$tmp_file"
     return 1
+  fi
+
+  # ───── 3.5 Проверка SHA256 (если файл .sha256 доступен) ─────
+  local sha_url="${UPDATE_URL%/*}/awg2.sh.sha256"
+  local sha_expected sha_actual
+  sha_expected=$(curl -fsSL --connect-timeout 10 --max-time 15 "$sha_url" 2>/dev/null | awk '{print $1}')
+  sha_actual=$(sha256sum "$tmp_file" 2>/dev/null | awk '{print $1}')
+  if [[ -n "$sha_expected" && -n "$sha_actual" ]]; then
+    if [[ "$sha_expected" != "$sha_actual" ]]; then
+      err "Контрольная сумма SHA256 не совпадает! Файл повреждён или подменён."
+      err "Ожидался: $sha_expected"
+      err "Получен:  $sha_actual"
+      rm -f "$tmp_file"
+      return 1
+    fi
+    ok "SHA256 проверен — файл целостен"
+  else
+    warn "Не удалось проверить SHA256 (файл .sha256 недоступен). Обновление продолжается без проверки целостности."
   fi
 
   # ───── 4. Извлечение версии ─────
@@ -2122,12 +2149,12 @@ show_submenu_5() {
     echo ""
     safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")"
     case "${SUB_CHOICE:-}" in
-      1) do_warp_menu || true ;;
-      2) do_dns_menu || true ;;
-      3) do_cascade_menu || true ;;
-      4) do_xray_menu || true ;;
-      5) do_tun2socks_menu || true ;;
-      6) do_awg_exits_menu || true ;;
+      1) do_warp_menu || true; set +e ;;
+      2) do_dns_menu || true; set +e ;;
+      3) do_cascade_menu || true; set +e ;;
+      4) do_xray_menu || true; set +e ;;
+      5) do_tun2socks_menu || true; set +e ;;
+      6) do_awg_exits_menu || true; set +e ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2437,7 +2464,8 @@ _share_config() {
 
   # Проверяем наличие I1-I5 в конфиге и общий размер
   local has_i1 conf_size
-  has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+  has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || true)
+  [[ "$has_i1" =~ ^[0-9]+$ ]] || has_i1=0
   conf_size=$(wc -c < "$conf_file")
 
   # QR лимит (с запасом) ~2800 байт
@@ -2471,13 +2499,14 @@ do_install() {
   # Detect OS
   local OS_ID OS_VER OS_CODENAME
   if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    local _SAVED_VERSION="$VERSION"
-    . /etc/os-release
-    VERSION="$_SAVED_VERSION"
-    OS_ID="${ID:-unknown}"
-    OS_VER="${VERSION_ID:-0}"
-    OS_CODENAME="${VERSION_CODENAME:-}"
+    # Парсим без . /etc/os-release — не clobberим globals
+    OS_ID=$(grep -E '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+    OS_ID="${OS_ID:-unknown}"
+    OS_VER=$(grep -E '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+    OS_VER="${OS_VER:-0}"
+    OS_CODENAME=$(grep -E '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+    OS_ID="${OS_ID:-unknown}"
+    OS_VER="${OS_VER:-0}"
   else
     err "Не удалось определить ОС (/etc/os-release отсутствует)"; return 1
   fi
@@ -2828,11 +2857,7 @@ do_autoinstall() {
   fi
 
   # 3. Настройка параметров по умолчанию (лучшая обфускация)
-  SERVER_REGION="ru"
-  TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-  DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-  SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-  QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+  _detect_server_region
 
   CLIENT_DNS="1.1.1.1, 1.0.0.1"
   MTU=1320
@@ -2913,7 +2938,7 @@ do_autoinstall() {
   {
     echo "# AWG_PROFILE=pro"
     echo "# AmneziaWG Toolza — AWG 2.0 server config (AUTOINSTALL)"
-    echo "# Region: ru"
+    echo "# Region: ${SERVER_REGION:-world}"
     echo "[Interface]"
     echo "PrivateKey = $srv_priv"
     echo "Address = $SERVER_ADDR"
@@ -3029,11 +3054,7 @@ do_add_client_noninteractive() {
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
   # Для мимикрии
-  SERVER_REGION="ru"
-  TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-  DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-  SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-  QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+  _detect_server_region
 
   if [[ "$_srv_profile" == "lite" ]]; then
     local cps_out
@@ -3098,7 +3119,17 @@ do_add_client_noninteractive() {
   psk_tmp=$(mktemp)
   chmod 600 "$psk_tmp"
   echo "$psk" > "$psk_tmp"
-  awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr"
+  if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
+    rm -f "$psk_tmp"
+    err "awg set не удался для клиента '$client_name' — откат"
+    # Откат: удаляем последние 6 строк из SERVER_CONF
+    local _tl
+    _tl=$(wc -l < "$SERVER_CONF")
+    if (( _tl > 6 )); then
+      head -n $((_tl - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
+    fi
+    exit 1
+  fi
   rm -f "$psk_tmp"
 
   # Читаем параметры AWG из сервера
@@ -3224,21 +3255,20 @@ do_gen() {
     4) CLIENT_ADDR="10.102.0.2/32"; SERVER_ADDR="10.102.0.1/24"; CLIENT_NET="10.102.0.0/24" ;;
     5) CLIENT_ADDR="10.44.5.2/32"; SERVER_ADDR="10.44.5.1/24"; CLIENT_NET="10.44.5.0/24" ;;
     6)
-      local _ip_re='^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
       while true; do
         read -rp "  IP клиента (X.X.X.X/32): " CLIENT_ADDR
-        [[ "$CLIENT_ADDR" =~ $_ip_re ]] && break
-        warn "Формат: 10.1.2.3/32"
+        _valid_ip_cidr "$CLIENT_ADDR" && break
+        warn "Формат: 10.1.2.3/32 (октеты 0-255, маска 0-32)"
       done
       while true; do
         read -rp "  IP сервера (X.X.X.X/24): " SERVER_ADDR
-        [[ "$SERVER_ADDR" =~ $_ip_re ]] && break
-        warn "Формат: 10.1.2.1/24"
+        _valid_ip_cidr "$SERVER_ADDR" && break
+        warn "Формат: 10.1.2.1/24 (октеты 0-255, маска 0-32)"
       done
       while true; do
         read -rp "  Подсеть NAT (X.X.X.0/24): " CLIENT_NET
-        [[ "$CLIENT_NET" =~ $_ip_re ]] && break
-        warn "Формат: 10.1.2.0/24"
+        _valid_ip_cidr "$CLIENT_NET" && break
+        warn "Формат: 10.1.2.0/24 (октеты 0-255, маска 0-32)"
       done
       ;;
   esac
@@ -3687,7 +3717,7 @@ do_rename_client() {
 
   if [[ ! -s "$tmp_conf" ]]; then
     err "awk не смог обработать конфиг, восстанавливаю из бекапа"
-    mv "$bak" "$SERVER_CONF"
+    mv "$bak" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
     rm -f "$tmp_conf"
     return 1
   fi
@@ -3777,7 +3807,7 @@ do_delete_client() {
 
   if [[ ! -s "$tmp_conf" ]]; then
     err "awk не смог обработать конфиг, восстанавливаю из бекапа"
-    mv "$bak" "$SERVER_CONF"
+    mv "$bak" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
     rm -f "$tmp_conf"
     return 1
   fi
@@ -4012,7 +4042,14 @@ do_add_client() {
     allowed-ips "$client_addr" && awg_set_ok=1
   rm -f "$psk_tmp"
   if [[ $awg_set_ok -eq 0 ]]; then
-    err "не удалось добавить peer в runtime"; return 1
+    err "не удалось добавить peer в runtime — откат"
+    # Откат: удаляем последние 6 строк из SERVER_CONF
+    local _tl
+    _tl=$(wc -l < "$SERVER_CONF")
+    if (( _tl > 6 )); then
+      head -n $((_tl - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
+    fi
+    return 1
   fi
 
   # Исправлено: читаем параметры только из секции [Interface]
@@ -4305,7 +4342,7 @@ do_bulk_add_clients() {
       local total_lines
       total_lines=$(wc -l < "$SERVER_CONF")
       if (( total_lines > 6 )); then
-        head -n $((total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
+        head -n $((total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
       fi
       skipped=$((skipped+1))
       idx=$((idx+1))
@@ -4651,10 +4688,14 @@ do_reset_server() {
     local srv_addr
     srv_addr=$(grep "^Address = " "$SERVER_CONF" | head -1 | awk -F'= ' '{print $2}' | tr -d ' ' || true)
     if [[ -n "$srv_addr" ]]; then
-      # 10.45.12.1/24 → 10.45.12.0/24
-      local base
-      base=$(echo "$srv_addr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s.0", $1, $2, $3}')
-      client_net="${base}/24"
+      # Корректный расчёт сети (поддержка /23, /22 и т.д.)
+      client_net=$(python3 -c 'import sys,ipaddress; print(ipaddress.ip_network(sys.argv[1], strict=False))' "$srv_addr" 2>/dev/null || echo "")
+      if [[ -z "$client_net" ]]; then
+        # Fallback для /24
+        local base
+        base=$(echo "$srv_addr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s.0", $1, $2, $3}')
+        client_net="${base}/24"
+      fi
     fi
   fi
   local iface
@@ -5091,7 +5132,9 @@ _warp_apply_peer_rules() {
     [[ -z "$ip" ]] && continue
     # Удаляем старое правило (если есть) и добавляем заново
     ip rule del from "$ip" lookup 200 2>/dev/null || true
-    ip rule add from "$ip" lookup 200
+    if ! ip rule add from "$ip" lookup 200 2>/dev/null; then
+      warn "Не удалось добавить ip rule для $ip (уже существует?)"
+    fi
   done < "$WARP_PEERS"
 }
 
@@ -5949,7 +5992,7 @@ _warp_status() {
       [[ -z "$peer_count" ]] && peer_count=0
     fi
     local total_clients
-    total_clients=$(_warp_list_awg_clients 2>/dev/null | grep -c '^' || echo "0")
+    total_clients=$(_warp_list_awg_clients 2>/dev/null | grep -c '^' || true)
     total_clients=$(echo "$total_clients" | tr -d '\n\r ')
     [[ -z "$total_clients" ]] && total_clients=0
     local pc_color="$G"
@@ -6136,7 +6179,7 @@ do_warp_menu() {
         _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
         read -rp "Enter..."
         ;;
-      6) do_warp_peers_menu || true ;;
+      6) do_warp_peers_menu || true; set +e ;;
       7) _warp_health_toggle; read -rp "Enter..." ;;
       8) _warp_import_account; read -rp "Enter..." ;;
       9) _warp_endpoint_finder; read -rp "Enter..." ;;
@@ -7042,6 +7085,7 @@ do_check_domains() {
   if [[ $total -eq 0 ]]; then
     warn "Нет доменов в пулах (регион: $check_region)"
     rm -rf "$tmpdir"
+    trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
     return 1
   fi
 
@@ -7114,7 +7158,7 @@ do_check_domains() {
   _show_pool "QUIC / HTTP/3"        "◆" "QUIC" "${quic_pool[@]}"
 
   rm -rf "$tmpdir"
-  trap - INT TERM
+  trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
 
   hdr "∑  Итог"
   local pct=$((avail_count * 100 / total))
@@ -7138,7 +7182,8 @@ do_clean_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { err "Конфиг сервера не найден"; return 1; }
 
   local client_count
-  client_count=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || echo "0")
+  client_count=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || true)
+  [[ "$client_count" =~ ^[0-9]+$ ]] || client_count=0
 
   if [[ $client_count -eq 0 ]]; then
     warn "Нет клиентов для удаления"
@@ -7179,7 +7224,7 @@ do_clean_clients() {
     return 1
   fi
 
-  mv "$temp_conf" "$SERVER_CONF"
+  mv "$temp_conf" "$SERVER_CONF" && chmod 600 "$SERVER_CONF"
   rm -f /root/*_awg2.conf 2>/dev/null || true
   
   info "Перезапускаем awg0..."
@@ -7270,9 +7315,9 @@ do_restore() {
 
   # Список доступных бекапов
   local backups=()
-  while IFS= read -r d; do
+  while IFS= read -r -d '' d; do
     [[ -f "$d/backup_meta.txt" ]] && backups+=("$d")
-  done < <(find "$BACKUP_DIR" -maxdepth 1 -type d -name "awg2_backup_*" | sort -r)
+  done < <(find "$BACKUP_DIR" -maxdepth 1 -type d -name "awg2_backup_*" -print0 | sort -rz)
 
   if [[ ${#backups[@]} -eq 0 ]]; then
     err "Нет доступных бекапов в $BACKUP_DIR"
@@ -7286,7 +7331,8 @@ do_restore() {
     local ts files
     ts=$(grep "^timestamp=" "$meta" 2>/dev/null | cut -d= -f2 || true)
     [[ -z "$ts" ]] && ts=$(basename "$b")
-    files=$(grep "^backed_files=" "$meta" 2>/dev/null | cut -d= -f2 || echo "?")
+    files=$(grep "^backed_files=" "$meta" 2>/dev/null | cut -d= -f2)
+files="${files:-?}"
     echo -e "  ${G}$i${N}) $ts  (файлов: $files)  [$(basename "$b")]"
     i=$((i + 1))
   done
@@ -7406,6 +7452,18 @@ _cascade_valid_ip() {
     [[ "${o[$i]}" =~ ^[0-9]+$ ]] || return 1
     (( ${o[$i]} <= 255 )) || return 1
   done
+  return 0
+}
+
+_valid_ip_cidr() {
+  local cidr="$1"
+  local ip mask
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+  ip="${cidr%/*}"
+  mask="${cidr#*/}"
+  [[ "$mask" =~ ^[0-9]+$ ]] || return 1
+  (( mask >= 0 && mask <= 32 )) || return 1
+  _cascade_valid_ip "$ip" || return 1
   return 0
 }
 
@@ -8035,6 +8093,9 @@ _cascade_add_rule_flow() {
   # ─── Комментарий ───
   safe_read comment "$(echo -e "${D}  Комментарий (Enter — пропустить): ${N}")"
   comment="${comment//|/ }"
+  comment="${comment//$'\n'/ }"
+  comment="${comment//$'\r'/ }"
+  comment="${comment//$'\t'/ }"
 
   # ─── Применение ───
   local protos=()
@@ -9188,7 +9249,7 @@ do_xray_menu() {
       5) _xray_up; read -rp "Enter..." ;;
       6) _xray_down; read -rp "Enter..." ;;
       7) _xray_down 2>/dev/null; _xray_up; read -rp "Enter..." ;;
-      8) do_xray_peers_menu ;;
+      8) do_xray_peers_menu; set +e ;;
       0) break ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -9526,7 +9587,7 @@ _xray_remove_outbound() {
 
   local target="${arr[$((opt-1))]}"
   info "Удаляем '$target'..."
-  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != '$target']; json.dump(conf, open('$XRAY_CONF','w'), indent=2)"
+  python3 -c "import json, sys; conf=json.load(open('$XRAY_CONF')); conf['outbounds'] = [o for o in conf.get('outbounds', []) if o.get('tag') != sys.argv[1]]; json.dump(conf, open('$XRAY_CONF','w'), indent=2)" "$target"
   ok "Outbound '$target' удалён."
 }
 
@@ -9715,14 +9776,20 @@ with open('$XRAY_CONF', 'w') as f:
   sysctl -w net.ipv4.conf."$tun_dev".rp_filter=2 >/dev/null 2>&1 || true
 
   # Настройка маршрутизации для клиентов
-  iptables -t nat -C POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE
-  iptables -C FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i awg0 -o "$tun_dev" -j ACCEPT
-  iptables -C FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "$tun_dev" -o awg0 -j ACCEPT
-  iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
-    iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu
+  if ! iptables -t nat -C POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null; then
+    if ! iptables -t nat -A POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE; then
+      warn "Не удалось добавить MASQUERADE для $tun_dev (Xray может работать некорректно)"
+    fi
+  fi
+  if ! iptables -C FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i awg0 -o "$tun_dev" -j ACCEPT || warn "Не удалось добавить FORWARD rule (awg0 → $tun_dev)"
+  fi
+  if ! iptables -C FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i "$tun_dev" -o awg0 -j ACCEPT || warn "Не удалось добавить FORWARD rule ($tun_dev → awg0)"
+  fi
+  if ! iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu || true
+  fi
 
   ip route add default dev "$tun_dev" table 201 2>/dev/null || true
   # Селективность по клиентам — только через per-IP правила из $XRAY_PEERS
@@ -9754,11 +9821,12 @@ with open('$XRAY_CONF', 'w') as f:
 }
 
 _xray_down() {
-  local tun_dev
+  local tun_dev client_net iface
   if [[ -f "$XRAY_STATE" ]]; then
     client_net=$(grep "^client_net=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
     iface=$(grep "^iface=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
-    tun_dev=$(grep "^tun_dev=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || echo "xray0")
+    tun_dev=$(grep "^tun_dev=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2)
+tun_dev="${tun_dev:-xray0}"
     _xray_remove_peer_rules
     if [[ -n "$client_net" ]]; then
       iptables -t nat -D POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || true
@@ -9811,7 +9879,7 @@ _xray_peer_add() {
 
 _xray_peer_del() {
   local ip="$1"
-  [[ -f "$XRAY_PEERS" ]] && sed -i "/^${ip}$/d" "$XRAY_PEERS"
+  [[ -f "$XRAY_PEERS" ]] && grep -vxF "$ip" "$XRAY_PEERS" > "${XRAY_PEERS}.tmp" && mv "${XRAY_PEERS}.tmp" "$XRAY_PEERS"
 }
 
 _xray_apply_peer_rules() {
@@ -9819,7 +9887,9 @@ _xray_apply_peer_rules() {
     while read -r ip; do
       [[ -z "$ip" ]] && continue
       ip rule del from "$ip" lookup 201 2>/dev/null || true
-      ip rule add from "$ip" lookup 201
+      if ! ip rule add from "$ip" lookup 201 2>/dev/null; then
+        warn "Не удалось добавить ip rule (Xray) для $ip"
+      fi
     done < "$XRAY_PEERS"
   fi
 }
@@ -9884,7 +9954,9 @@ do_xray_peers_menu() {
         ;;
       d|D)
         _xray_remove_peer_rules
-        > "$XRAY_PEERS"
+        if ! : > "$XRAY_PEERS" 2>/dev/null; then
+          warn "Не удалось очистить $XRAY_PEERS — права? Правила могли остаться активными"
+        fi
         ok "Все клиенты идут напрямую (AWG -> eth0)"
         sleep 1
         ;;
@@ -9904,7 +9976,9 @@ do_xray_peers_menu() {
             _xray_peer_add "$ip"
             if ip link show xray0 &>/dev/null; then
               ip rule del from "$ip" lookup 201 2>/dev/null || true
-              ip rule add from "$ip" lookup 201
+              if ! ip rule add from "$ip" lookup 201 2>/dev/null; then
+                warn "Не удалось добавить ip rule (Xray) для $ip"
+              fi
             fi
             ok "$name → через Xray"
           fi
@@ -10193,11 +10267,14 @@ start_routing() {
   [[ ! -f "$AWG_EXITS_STATE" ]] && { echo "exits_state missing" >&2; exit 0; }
   
   local mode
-  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+mode="${mode:-all}"
   local balancer
-  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "single")
+  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+balancer="${balancer:-single}"
   local single_exit
-  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "")
+  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+single_exit="${single_exit:-}"
 
   local configured_interfaces=()
   for conf in "$AWG_EXITS_DIR"/awg-exit-*.conf; do
@@ -10244,11 +10321,11 @@ start_routing() {
   client_net=$(get_client_net) || { echo "cannot get client net" >&2; exit 1; }
 
   if [[ "$balancer" == "ecmp" && ${#up_interfaces[@]} -gt 1 ]]; then
-    local route_cmd="ip route replace default table 202"
+    local route_args=("ip" "route" "replace" "default" "table" "202")
     for iface in "${up_interfaces[@]}"; do
-      route_cmd="$route_cmd nexthop dev $iface weight 1"
+      route_args+=("nexthop" "dev" "$iface" "weight" "1")
     done
-    eval "$route_cmd"
+    "${route_args[@]}"
     sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
     echo "ECMP balancing enabled on: ${up_interfaces[*]}"
   else
@@ -10372,9 +10449,11 @@ _exits_status() {
     state_val=$(head -1 "$AWG_EXITS_STATE" 2>/dev/null)
     if [[ "$state_val" == "active" ]]; then
       local mode
-      mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+      mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+mode="${mode:-all}"
       local balancer
-      balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "single")
+      balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+balancer="${balancer:-single}"
       if [[ "$mode" == "all" ]]; then
         echo -e "  Маршрутизация       : ${G}● Включена (все клиенты)${N}"
       else
@@ -10386,7 +10465,8 @@ _exits_status() {
         echo -e "  Режим балансировки  : ${Y}● ECMP балансировка${N}"
       else
         local single_exit
-        single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "unknown")
+        single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+single_exit="${single_exit:-unknown}"
         echo -e "  Режим балансировки  : ${C}Single Exit ($single_exit)${N}"
       fi
       
@@ -10534,7 +10614,8 @@ PYEOF
     if [[ "$make_active" == "y" ]]; then
       local mode_val="all"
       if [[ -f "$AWG_EXITS_STATE" ]]; then
-        mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+        mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+mode_val="${mode_val:-all}"
       fi
       cat > "$AWG_EXITS_STATE" << EOF
 active
@@ -10773,7 +10854,8 @@ _exits_setup_balancing() {
 
   local mode_val="all"
   if [[ -f "$AWG_EXITS_STATE" ]]; then
-    mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+    mode_val=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+mode_val="${mode_val:-all}"
   fi
 
   mkdir -p "$AWG_EXITS_DIR"
@@ -10860,8 +10942,10 @@ _exits_up() {
   local balancer="single"
   local single_exit=""
   if [[ -f "$AWG_EXITS_STATE" ]]; then
-    balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "single")
-    single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "")
+    balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+balancer="${balancer:-single}"
+    single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+single_exit="${single_exit:-}"
   fi
   if [[ -z "$single_exit" ]]; then
     local first_fullname="${up_exits[0]}"
@@ -10926,13 +11010,16 @@ _ensure_peers_mode() {
   # добавляются. Дальше переключатели реально управляют маршрутизацией.
   [[ -f "$AWG_EXITS_STATE" ]] || return 0
   local mode
-  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "all")
+  mode=$(grep "^mode=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+mode="${mode:-all}"
   [[ "$mode" == "all" ]] || return 0
   systemctl is-active --quiet awg-exits-routing.service 2>/dev/null || return 0
 
   local balancer single_exit
-  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "single")
-  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || echo "")
+  balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+balancer="${balancer:-single}"
+  single_exit=$(grep "^single_exit=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2)
+single_exit="${single_exit:-}"
 
   mkdir -p "$AWG_EXITS_DIR"
   : > "$AWG_EXITS_PEERS"
@@ -11085,7 +11172,7 @@ do_awg_exits_menu() {
       3) _exits_delete; read -rp "Enter..." ;;
       4) _exits_toggle_routing; read -rp "Enter..." ;;
       5) _exits_setup_balancing; read -rp "Enter..." ;;
-      6) do_exits_peers_menu ;;
+      6) do_exits_peers_menu; set +e ;;
       0) break ;;
       *) warn "Неверный выбор" ;;
     esac
